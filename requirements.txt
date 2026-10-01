@@ -1,0 +1,5 @@
+# Pi 5 / Raspberry Pi OS Desktop, Python 3.
+# OpenCV (cv2), Tkinter (_tkinter), and lgpio are installed by setup.sh via APT.
+# APT-provided numpy satisfies this pip requirement inside the --system-site-packages venv.
+# Do not add opencv-python or opencv-python-headless here: avoid mixing two cv2 builds.
+numpy>=1.24,<3
