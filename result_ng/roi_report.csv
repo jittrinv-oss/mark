@@ -1,0 +1,5 @@
+﻿name,mode,x,y,w,h,master_line_px,test_line_px,score,threshold,verdict,master_ink,test_ink,ink_ratio,corr
+5NI_UNDERLINE,line,90,378,90,26,65,0,0.0,0.6,NG,,,,
+5NI_TEXT,ink,98,398,80,36,,,,0.55,OK,403,433,1.074,0.959
+TEMPERLITE,ink,195,395,260,40,,,,0.55,OK,1408,1516,1.077,0.952
+E6_APPROVAL,ink,60,180,330,60,,,,0.55,OK,2714,2873,1.059,0.962

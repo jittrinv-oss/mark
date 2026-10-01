@@ -1,0 +1,77 @@
+{
+  "timestamp": "2026-09-29T11:06:19",
+  "align_method": "ORB+RANSAC",
+  "align_inliers": 335,
+  "verdict": "NG",
+  "n_missing": 1,
+  "n_extra": 0,
+  "significant_defects": [
+    {
+      "type": "MISSING",
+      "x": 103,
+      "y": 392,
+      "w": 65,
+      "h": 5,
+      "area": 321,
+      "cx": 135.0,
+      "cy": 394.0
+    }
+  ],
+  "roi_results": [
+    {
+      "name": "5NI_UNDERLINE",
+      "mode": "line",
+      "x": 90,
+      "y": 378,
+      "w": 90,
+      "h": 26,
+      "master_line_px": 65,
+      "test_line_px": 0,
+      "score": 0.0,
+      "threshold": 0.6,
+      "verdict": "NG"
+    },
+    {
+      "name": "5NI_TEXT",
+      "mode": "ink",
+      "x": 98,
+      "y": 398,
+      "w": 80,
+      "h": 36,
+      "master_ink": 403,
+      "test_ink": 433,
+      "ink_ratio": 1.074,
+      "corr": 0.959,
+      "threshold": 0.55,
+      "verdict": "OK"
+    },
+    {
+      "name": "TEMPERLITE",
+      "mode": "ink",
+      "x": 195,
+      "y": 395,
+      "w": 260,
+      "h": 40,
+      "master_ink": 1408,
+      "test_ink": 1516,
+      "ink_ratio": 1.077,
+      "corr": 0.952,
+      "threshold": 0.55,
+      "verdict": "OK"
+    },
+    {
+      "name": "E6_APPROVAL",
+      "mode": "ink",
+      "x": 60,
+      "y": 180,
+      "w": 330,
+      "h": 60,
+      "master_ink": 2714,
+      "test_ink": 2873,
+      "ink_ratio": 1.059,
+      "corr": 0.962,
+      "threshold": 0.55,
+      "verdict": "OK"
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "master": "master.jpg",
+  "rois": [
+    {
+      "name": "5NI_UNDERLINE",
+      "x": 90,
+      "y": 378,
+      "w": 90,
+      "h": 26,
+      "mode": "line",
+      "line_min_len_ratio": 0.6
+    },
+    {
+      "name": "5NI_TEXT",
+      "x": 98,
+      "y": 398,
+      "w": 80,
+      "h": 36,
+      "mode": "ink",
+      "min_ratio": 0.55,
+      "min_corr": 0.4
+    },
+    {
+      "name": "TEMPERLITE",
+      "x": 195,
+      "y": 395,
+      "w": 260,
+      "h": 40,
+      "mode": "ink",
+      "min_ratio": 0.55,
+      "min_corr": 0.4
+    },
+    {
+      "name": "E6_APPROVAL",
+      "x": 60,
+      "y": 180,
+      "w": 330,
+      "h": 60,
+      "mode": "ink",
+      "min_ratio": 0.55,
+      "min_corr": 0.4
+    }
+  ]
+}
