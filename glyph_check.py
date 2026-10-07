@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""glyph_check.py — ตรวจ "องค์ประกอบจางขาดหาย" แบบอัตโนมัติ (v4)"""
+"""
+glyph_check.py — ตรวจ "องค์ประกอบจางขาดหาย" แบบอัตโนมัติ  (v7)
+
+v7 แก้ปัญหา "ตัวอักษรปกติ (H, 2, M, T) ขึ้นสีส้ม" เมื่อใช้ Master จาก PDF กับภาพถ่ายจริง
+สาเหตุ:
+  ก) ภาพถ่ายจริงเลนส์โค้ง/กระดาษไม่เรียบ -> homography ตัวเดียวทั้งภาพจัดตำแหน่งได้
+     ไม่ตรงทุกจุด บางตัวอักษรเลื่อน 3-8 px -> ขอบตัวอักษรถูกนับว่า "หาย"
+  ข) เส้นใน PDF (vector) กับเส้นในภาพถ่าย หนา-บางต่างกัน -> tolerance ตายตัว 2-4 px ไม่พอ
+  ค) เกณฑ์ PARTIAL เดิมดูแค่ "ขอบเขต" ของส่วนที่หาย (แนวตั้ง/แนวนอน) ไม่ดูว่าหายไปจริงกี่ %
+     ขอบบาง ๆ รอบตัวอักษรที่หลุดแนว ก็ทำให้ขอบเขตกว้างพอจะฟ้องได้
+แก้:
+  1) Local re-align: แต่ละชิ้นส่วนหา offset ที่ดีที่สุดในรัศมี ±local_search px ก่อนวัด
+  2) Tolerance ตามความหนาเส้น: tol = max(tol_px, stroke_tol × ความหนาเส้นของชิ้นนั้น)
+  3) ต้องหมึกหายจริงอย่างน้อย min_loss (ค่าเริ่ม 25%) ของชิ้น ถึงจะเป็น PARTIAL
+  4) หมึกเกิน (สีม่วง) ไม่นับบริเวณขอบภาพที่เกิดจากการ warp
+"""
 import argparse, json, os
 from datetime import datetime
 import numpy as np
@@ -9,26 +24,29 @@ import cv2
 from mark_match import to_ink_mask, align
 
 
+# =====================================================================
+# 1) แยกชิ้นส่วนจาก Master
+# =====================================================================
 def segment_elements(mask, min_area=40, merge_gap=0, dash_params=None):
     work = mask
     if merge_gap > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * merge_gap + 1, 2 * merge_gap + 1))
-        work = cv2.dilate(mask, k)
+        work = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (2 * merge_gap + 1,) * 2))
     n, lab, stats, _ = cv2.connectedComponentsWithStats(work, 8)
+    dist = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 3)
     els = []
     for i in range(1, n):
         if stats[i, cv2.CC_STAT_AREA] < min_area:
             continue
-        x, y = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP]
-        w, h = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
-        sub = np.zeros((h, w), np.uint8)
-        sub[lab[y:y + h, x:x + w] == i] = 255
+        x, y, w, h = (int(v) for v in stats[i, :4])
+        sub = np.where(lab[y:y + h, x:x + w] == i, 255, 0).astype(np.uint8)
         sub = cv2.bitwise_and(sub, mask[y:y + h, x:x + w])
-        a = int(sub.sum() // 255)
+        a = int((sub > 0).sum())
         if a < min_area:
             continue
-        els.append(dict(id=0, x=int(x), y=int(y), w=int(w), h=int(h), area=a,
-                        cx=float(x + w / 2), cy=float(y + h / 2), mask=sub, kind=None))
+        d = dist[y:y + h, x:x + w][sub > 0]
+        stroke = float(2 * np.percentile(d, 90)) if d.size else 2.0   # ความหนาเส้นโดยประมาณ
+        els.append(dict(id=0, x=x, y=y, w=w, h=h, area=a, stroke=stroke,
+                        cx=x + w / 2, cy=y + h / 2, mask=sub, kind=None))
     if els:
         base_h = float(np.median([e["h"] for e in els]))
         for e in els:
@@ -77,12 +95,14 @@ def _is_regular(vals, cv_max):
 
 def mark_dash_groups(els, img_w, img_h, min_count=4, gap_cv_max=0.6,
                      edge_ratio=0.07, area_percentile=70):
+    """ขีดบาง ๆ เรียงระยะสม่ำเสมอที่ริมขอบภาพ = เส้นประ/สเกล -> kind='DASH'"""
     if not els:
         return
     max_area = max(60.0, float(np.percentile([e["area"] for e in els], area_percentile)))
     ex, ey = max(15, int(edge_ratio * img_w)), max(15, int(edge_ratio * img_h))
     xt, yt = max(10, int(0.025 * img_w)), max(10, int(0.025 * img_h))
-    sm = [e for e in els if e["area"] < max_area]
+    sm = [e for e in els if e["area"] < max_area
+          and min(e["w"], e["h"]) <= 0.35 * max(e["w"], e["h"])]
     for pool in ([e for e in sm if e["cx"] < ex], [e for e in sm if e["cx"] > img_w - ex]):
         for g in _cluster_1d(pool, lambda e: e["cx"], xt):
             if len(g) >= min_count and _is_regular([e["cy"] for e in g], gap_cv_max):
@@ -96,49 +116,64 @@ def mark_dash_groups(els, img_w, img_h, min_count=4, gap_cv_max=0.6,
                     e["kind"] = "DASH"
 
 
-def extent_fractions(el, test_mask, tol_px=2, loss_density=0.60):
+# =====================================================================
+# 2) วัดการหาย (v7: local re-align + tolerance ตามความหนาเส้น)
+# =====================================================================
+def extent_fractions(el, test_mask, tol_px=2, loss_density=0.60, local_search=0, stroke_tol=0.0):
+    """
+    คืน (cov, vfrac, hfrac, (dx, dy))
+    v7 หลักการ:
+      1) Local re-align: เลื่อนชิ้นส่วนของ Master ไปรอบ ๆ ±local_search px
+         แล้วเลือกตำแหน่งที่ "หมึกทับกันมากที่สุด" (นับพิกเซลจริง ไม่ใช่ประมาณ)
+         -> ภาพถ่ายบิดเบี้ยวเล็กน้อยจะไม่ถูกนับว่าหมึกหาย
+         ส่วนที่หายจริง ไม่ว่าเลื่อนไปทางไหนก็ไม่มีหมึกมาเติม จึงยังถูกจับได้
+      2) Tolerance ตามความหนาเส้น
+      3) "หายจริง = เนื้อเส้นหายทั้งความหนา": ลบเศษบาง ๆ ตามขอบเส้นด้วย opening
+    """
     x, y, w, h = el["x"], el["y"], el["w"], el["h"]
-    H, W = test_mask.shape
-    pad = tol_px + 2
-    x0, y0 = max(0, x - pad), max(0, y - pad)
-    x1, y1 = min(W, x + w + pad), min(H, y + h + pad)
-    troi = test_mask[y0:y1, x0:x1]
-    if tol_px > 0:
-        troi = cv2.dilate(troi, np.ones((2 * tol_px + 1, 2 * tol_px + 1), np.uint8))
-    ox, oy = x - x0, y - y0
-    m = el["mask"]
-    t = troi[oy:oy + h, ox:ox + w]
-    kept = cv2.bitwise_and(m, t)
-    cov = (kept > 0).sum() / max((m > 0).sum(), 1)
-    lost = cv2.subtract(m, kept)
-    if lost.max() == 0:
-        return float(cov), 0.0, 0.0
-    k = max(3, int(round(min(w, h) * 0.12)) | 1)
-    lost_c = cv2.morphologyEx(lost, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
-    lost_c = cv2.bitwise_and(cv2.dilate(lost_c, np.ones((3, 3), np.uint8)),
-                             cv2.dilate(m, np.ones((3, 3), np.uint8)))
-    n, lab, st, _ = cv2.connectedComponentsWithStats(lost_c, 8)
-    bx0, by0, bx1, by1 = w, h, 0, 0
-    found = False
-    for i in range(1, n):
-        bx, by = st[i, cv2.CC_STAT_LEFT], st[i, cv2.CC_STAT_TOP]
-        bw, bh = st[i, cv2.CC_STAT_WIDTH], st[i, cv2.CC_STAT_HEIGHT]
-        ink_in = (m[by:by + bh, bx:bx + bw] > 0).sum()
-        lost_in = (lost[by:by + bh, bx:bx + bw] > 0).sum()
-        if ink_in < 6:
-            continue
-        if lost_in / ink_in >= loss_density:
-            ys, xs = np.nonzero((lab == i) & (lost > 0))
-            if len(xs) == 0:
-                continue
-            found = True
-            bx0, by0 = min(bx0, xs.min()), min(by0, ys.min())
-            bx1, by1 = max(bx1, xs.max() + 1), max(by1, ys.max() + 1)
-    if not found:
-        return float(cov), 0.0, 0.0
-    return float(cov), (by1 - by0) / h, (bx1 - bx0) / w
+    m = (el["mask"] > 0).astype(np.uint8)
+    stroke = float(el.get("stroke", 4.0))
+    tol = int(round(max(tol_px, stroke_tol * stroke)))
+    # รัศมีค้นหา: สัดส่วนของขนาดชิ้น (ภาพถ่ายจริง ระยะห่างตัวอักษรอาจต่างจาก CAD หลาย px)
+    s = int(min(15, max(3, local_search * min(w, h)))) if local_search else 0
+    Ht, Wt = test_mask.shape
+    pad = tol + s + 2
+    X0, Y0 = x - pad, y - pad
+    canvas = np.zeros((h + 2 * pad, w + 2 * pad), np.uint8)
+    cx0, cy0 = max(0, X0), max(0, Y0)
+    cx1, cy1 = min(Wt, x + w + pad), min(Ht, y + h + pad)
+    if cx1 > cx0 and cy1 > cy0:
+        canvas[cy0 - Y0:cy1 - Y0, cx0 - X0:cx1 - X0] = (test_mask[cy0:cy1, cx0:cx1] > 0)
+    if tol > 0:
+        canvas = cv2.dilate(canvas, np.ones((2 * tol + 1,) * 2, np.uint8))
+    # เลือก offset ที่ทับกันมากที่สุด (เท่ากันให้เลือกที่เลื่อนน้อยสุด)
+    dx = dy = 0
+    if s > 0:
+        win = canvas[pad - s:pad + h + s, pad - s:pad + w + s].astype(np.float32)
+        res = cv2.matchTemplate(win, m.astype(np.float32), cv2.TM_CCORR)
+        yy, xx = np.mgrid[-s:s + 1, -s:s + 1]
+        score = res - 1e-3 * (np.abs(xx) + np.abs(yy))
+        iy, ix = np.unravel_index(np.argmax(score), score.shape)
+        dx, dy = int(ix - s), int(iy - s)
+    t = canvas[pad + dy:pad + dy + h, pad + dx:pad + dx + w]
+    lost = (m & (1 - t)).astype(np.uint8) * 255
+    k = max(3, int(round(stroke * 0.55)))
+    lost = cv2.morphologyEx(lost, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    lost[m == 0] = 0
+    n, lab, st, _ = cv2.connectedComponentsWithStats(lost, 8)
+    keep = np.zeros(n, bool)
+    keep[1:] = st[1:, cv2.CC_STAT_AREA] >= max(6, 0.02 * el["area"])
+    real = keep[lab]
+    cov = 1.0 - real.sum() / max(int(m.sum()), 1)
+    if not real.any():
+        return float(cov), 0.0, 0.0, (dx, dy)
+    ys, xs = np.nonzero(real)
+    return float(cov), (ys.max() - ys.min() + 1) / h, (xs.max() - xs.min() + 1) / w, (dx, dy)
 
 
+# =====================================================================
+# 3) ภาพเบลอ
+# =====================================================================
 def _sharp(g):
     return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
@@ -168,8 +203,7 @@ def background_noise_std(gray, patch=50):
     return float(np.median(v))
 
 
-def is_blurred(el, master_bgr, aligned_bgr, baseline, bg_std,
-               blur_rel_thr=0.35, content_factor=3.0):
+def is_blurred(el, master_bgr, aligned_bgr, baseline, bg_std, blur_rel_thr=0.35, content_factor=3.0):
     gm, gt = _crop(master_bgr, el), _crop(aligned_bgr, el)
     sm = _sharp(gm)
     if sm < 6.0 or baseline <= 0:
@@ -179,15 +213,19 @@ def is_blurred(el, master_bgr, aligned_bgr, baseline, bg_std,
     return (rel < blur_rel_thr and content > content_factor), rel, content
 
 
+# =====================================================================
+# 4) ตัดสิน
+# =====================================================================
 def judge(cov, vfrac, hfrac, p):
-    if vfrac < p["min_extent"] or hfrac < p["min_extent"]:
+    loss = 1.0 - cov
+    if vfrac < p["min_extent"] or hfrac < p["min_extent"] or loss < p["min_loss"]:
         if vfrac == 0 and hfrac == 0:
             return "OK", f"ครบ ({cov:.0%})"
-        return "OK", (f"หายเล็กน้อย ไม่ถึงเกณฑ์ (แนวตั้ง {vfrac:.0%}, "
-                      f"แนวนอน {hfrac:.0%} < {p['min_extent']:.0%})")
+        return "OK", (f"หายเล็กน้อย ไม่ถึงเกณฑ์ (หาย {loss:.0%}, "
+                      f"แนวตั้ง {vfrac:.0%}, แนวนอน {hfrac:.0%})")
     if cov < p["miss_full"]:
         return "MISSING", f"หายทั้งชิ้น (เหลือ {cov:.0%}) แนวตั้ง {vfrac:.0%} แนวนอน {hfrac:.0%}"
-    return "PARTIAL", f"จางขาดหาย (เหลือ {cov:.0%}) แนวตั้ง {vfrac:.0%} แนวนอน {hfrac:.0%}"
+    return "PARTIAL", f"จางขาดหาย (หาย {loss:.0%}) แนวตั้ง {vfrac:.0%} แนวนอน {hfrac:.0%}"
 
 
 def in_ignore(cx, cy, zones):
@@ -205,7 +243,12 @@ def mask_out(mask, zones):
 
 
 DEFAULT_P = dict(
-    min_extent=0.30, row_loss_thr=0.60, miss_full=0.25,
+    min_extent=0.30,      # ส่วนที่หายต้องกว้าง ≥30% และสูง ≥30% ของชิ้น
+    min_loss=0.08,        # v7: เนื้อหมึกต้องหายจริง ≥8% ของชิ้น (ชิ้นปกติวัดได้ ~0%)
+    row_loss_thr=0.60,    # ความหนาแน่นการหายภายในบริเวณที่หาย
+    miss_full=0.25,       # เหลือ <25% = หายทั้งชิ้น
+    local_search=0.35,    # v7: ค้นหาตำแหน่งชิ้นส่วนรอบ ๆ ±35% ของขนาดชิ้น (แก้ภาพถ่ายบิดเบี้ยว)
+    stroke_tol=0.35,      # v7: tolerance = 35% ของความหนาเส้น (อย่างน้อย tol_px)
     check_blur=True, blur_rel_thr=0.35, content_factor=3.0,
     check_dash=True, dash_edge_ratio=0.07, dash_min_count=4,
     dash_gap_cv_max=0.6, dash_area_percentile=70,
@@ -217,8 +260,9 @@ DEFAULT_P = dict(
 def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
     p = dict(DEFAULT_P); p.update(params or {})
     zones = ignore_zones or []
-    aligned, method, inl = align(test_bgr, master_bgr)
-    mmask, tmask = to_ink_mask(master_bgr), to_ink_mask(aligned)
+    aligned, method, inl, valid = align(test_bgr, master_bgr, return_valid=True)
+    mmask = to_ink_mask(master_bgr)
+    tmask = to_ink_mask(aligned, valid=valid)
     dp = dict(min_count=p["dash_min_count"], gap_cv_max=p["dash_gap_cv_max"],
               edge_ratio=p["dash_edge_ratio"], area_percentile=p["dash_area_percentile"])
     els = segment_elements(mmask, p["min_area"], p["merge_gap"],
@@ -229,11 +273,15 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
     rows, ng, n_blur, n_dash = [], 0, 0, 0
     for el in els:
         cov = vfrac = hfrac = None
+        off = (0, 0)
         z = in_ignore(el["cx"], el["cy"], zones)
+        outside = valid[min(valid.shape[0] - 1, int(el["cy"])), min(valid.shape[1] - 1, int(el["cx"]))] == 0
         if p["check_dash"] and el["kind"] == "DASH":
             status, note = "SKIP", "เส้นประ/สเกล — ไม่ตรวจ"; n_dash += 1
         elif z:
             status, note = "SKIP", f"อยู่ในโซน {z}"
+        elif outside:
+            status, note = "SKIP", "อยู่นอกภาพถ่าย — ไม่ตรวจ"
         else:
             blur, rel, con = (False, 1, 1)
             if p["check_blur"]:
@@ -242,19 +290,21 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
             if blur:
                 status, note = "SKIP", f"ภาพเบลอ (คมชัด {rel:.0%} ของปกติ) — ข้าม"; n_blur += 1
             else:
-                cov, vfrac, hfrac = extent_fractions(el, tmask, p["tol_px"], p["row_loss_thr"])
+                cov, vfrac, hfrac, off = extent_fractions(
+                    el, tmask, p["tol_px"], p["row_loss_thr"], float(p["local_search"]), p["stroke_tol"])
                 status, note = judge(cov, vfrac, hfrac, p)
                 ng += status != "OK"
         rows.append(dict(id=el["id"], kind=el["kind"], status=status, note=note,
                          x=el["x"], y=el["y"], w=el["w"], h=el["h"], area=el["area"],
+                         dx=off[0], dy=off[1],
                          cov=None if cov is None else round(cov, 3),
                          vfrac=None if vfrac is None else round(vfrac, 3),
                          hfrac=None if hfrac is None else round(hfrac, 3)))
 
     extras = []
     if p["check_extra"]:
-        k = np.ones((2 * p["tol_px"] + 3,) * 2, np.uint8)
-        ex = cv2.subtract(mask_out(tmask, zones), cv2.dilate(mmask, k))
+        tol = max(p["tol_px"], 6)
+        ex = cv2.subtract(mask_out(tmask, zones), cv2.dilate(mmask, np.ones((2 * tol + 3,) * 2, np.uint8)))
         ex = cv2.morphologyEx(ex, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         n, _, st, _ = cv2.connectedComponentsWithStats(ex, 8)
         extras = [dict(x=int(st[i, 0]), y=int(st[i, 1]), w=int(st[i, 2]), h=int(st[i, 3]),
@@ -275,21 +325,31 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
 COLOR = {"OK": (0, 170, 0), "PARTIAL": (0, 165, 255), "MISSING": (0, 0, 255), "SKIP": (150, 150, 150)}
 
 
-def draw(master_bgr, aligned, rows, extras, zones):
-    L, R = master_bgr.copy(), aligned.copy()
+def draw_result(aligned, rows, extras, zones, show_ok=True):
+    R = aligned.copy()
     for z in zones:
-        for im in (L, R):
-            cv2.rectangle(im, (z["x"], z["y"]), (z["x"] + z["w"], z["y"] + z["h"]), (160, 160, 160), 2)
+        cv2.rectangle(R, (z["x"], z["y"]), (z["x"] + z["w"], z["y"] + z["h"]), (160, 160, 160), 2)
     for r in rows:
-        c = COLOR[r["status"]]
         bad = r["status"] in ("MISSING", "PARTIAL")
-        cv2.rectangle(R, (r["x"] - 2, r["y"] - 2), (r["x"] + r["w"] + 2, r["y"] + r["h"] + 2), c, 3 if bad else 1)
+        if not bad and not show_ok:
+            continue
+        c = COLOR[r["status"]]
+        x, y = r["x"] + r.get("dx", 0), r["y"] + r.get("dy", 0)
+        cv2.rectangle(R, (x - 2, y - 2), (x + r["w"] + 2, y + r["h"] + 2), c, 3 if bad else 1)
         if bad:
-            cv2.rectangle(L, (r["x"] - 2, r["y"] - 2), (r["x"] + r["w"] + 2, r["y"] + r["h"] + 2), c, 2)
-            cv2.putText(R, f'#{r["id"]}', (r["x"], max(12, r["y"] - 4)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv2.LINE_AA)
+            cv2.putText(R, f'#{r["id"]}', (x, max(14, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2, cv2.LINE_AA)
     for e in extras:
         cv2.rectangle(R, (e["x"] - 2, e["y"] - 2), (e["x"] + e["w"] + 2, e["y"] + e["h"] + 2), (255, 0, 255), 2)
+    return R
+
+
+def draw(master_bgr, aligned, rows, extras, zones):
+    L = master_bgr.copy()
+    for r in rows:
+        if r["status"] in ("MISSING", "PARTIAL"):
+            cv2.rectangle(L, (r["x"] - 2, r["y"] - 2), (r["x"] + r["w"] + 2, r["y"] + r["h"] + 2),
+                          COLOR[r["status"]], 2)
+    R = draw_result(aligned, rows, extras, zones, show_ok=True)
     h = max(L.shape[0], R.shape[0])
     f = lambda im: cv2.copyMakeBorder(im, 0, h - im.shape[0], 0, 0, cv2.BORDER_CONSTANT, value=(40, 40, 40))
     return np.hstack([f(L), np.full((h, 6, 3), 60, np.uint8), f(R)])
@@ -299,16 +359,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--master", required=True); ap.add_argument("--test", required=True)
     ap.add_argument("--ignore"); ap.add_argument("--out", default="res_glyph")
-    ap.add_argument("--min-extent", type=float, default=0.30)
+    ap.add_argument("--set", nargs="*", default=[], help="เช่น --set min_loss=0.3 local_search=0")
     a = ap.parse_args()
     rd = lambda f: cv2.imdecode(np.fromfile(f, np.uint8), cv2.IMREAD_COLOR)
     zones = json.load(open(a.ignore, encoding="utf-8")).get("ignore", []) if a.ignore else []
-    rep, ov, *_ = inspect_glyph(rd(a.master), rd(a.test), zones, dict(min_extent=a.min_extent))
+    params = {}
+    for kv in a.set:
+        k, v = kv.split("=")
+        params[k] = type(DEFAULT_P[k])(float(v)) if not isinstance(DEFAULT_P[k], bool) else v in ("1", "True", "true")
+    rep, ov, *_ = inspect_glyph(rd(a.master), rd(a.test), zones, params)
     os.makedirs(a.out, exist_ok=True)
     cv2.imencode(".png", ov)[1].tofile(os.path.join(a.out, "overlay.png"))
     json.dump(rep, open(os.path.join(a.out, "report.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
     print(f'RESULT = {rep["verdict"]}  align={rep["align_method"]}  ชิ้น={rep["n_elements"]} '
-          f'MISSING={rep["n_missing"]} PARTIAL={rep["n_partial"]} SKIP={rep["n_skip"]}')
+          f'MISSING={rep["n_missing"]} PARTIAL={rep["n_partial"]} SKIP={rep["n_skip"]} EXTRA={rep["n_extra"]}')
+    for r in rep["elements"]:
+        if r["status"] in ("MISSING", "PARTIAL"):
+            print(f'  [{r["status"]}] #{r["id"]} {r["kind"]} ({r["x"]},{r["y"]}) {r["w"]}x{r["h"]} {r["note"]}')
 
 
 if __name__ == "__main__":

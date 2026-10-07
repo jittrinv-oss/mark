@@ -1,0 +1,4 @@
+# Windows:  python -m pip install -r requirements-windows.txt
+numpy>=1.24
+opencv-python>=4.8
+pymupdf>=1.23

@@ -1,87 +1,45 @@
-# Mark Inspection: Raspberry Pi 5 setup
+# ระบบตรวจมาร์คกระจก (AATH) — v7
 
-This guide accompanies the **Pi 5 migration helpers** (`requirements.txt`, `setup.sh`, and `run.sh`). Put these files alongside your **existing, tested** `mark_ui.py`, `glyph_check.py`, and `mark_match.py`. The helpers install dependencies; they do **not** replace your inspection algorithm or connect its OK/NG result to the PLC.
+## v7 แก้อะไร
+ตัวอักษรปกติ (H, 2, M, T, A) ขึ้นกรอบส้ม/ทำให้ NG ทั้งที่ไม่ได้หาย เมื่อใช้ Master จาก PDF กับภาพถ่ายจริง
 
-## Before you begin
+| สาเหตุ | แก้ |
+|---|---|
+| หมึกดำในภาพถ่ายติดโทนน้ำตาล ถูกลบทิ้งเหมือน "รอยปากกาสี" -> ตัวอักษรขาดเป็นท่อน | ลบเฉพาะสีจัดจริง (น้ำเงิน/แดง) |
+| ตัดหมึกด้วย adaptive threshold ตัวอักษรเส้นบาง/หมึกเทาแตก | ปรับพื้นหลังให้เรียบ + Otsu |
+| ภาพถ่ายบิดเบี้ยว / ระยะตัวอักษรบนงานจริงต่างจาก CAD หลาย px | จัดตำแหน่ง 2 รอบ (ORB+ECC) + จัดตำแหน่งรายตัวอักษร |
+| เศษขอบบาง ๆ จากภาพเลื่อนถูกนับเป็น "หาย" | นับเฉพาะเนื้อเส้นที่หายทั้งความหนา |
+| ขอบภาพสีขาวหลัง warp กลายเป็นหมึกเกินสีม่วง | ตัดบริเวณนอกภาพถ่ายออก |
 
-- Boot **64-bit Raspberry Pi OS Desktop** on the Pi 5. A graphical desktop is needed to see the Tkinter UI.
-- Back up your current `mark_inspection` folder, including Master images and configuration JSON files. Do not copy a Windows `.venv` to the Pi.
-- Obtain IT approval before connecting the Pi to a company network or using its package source. `setup.sh` can call APT to install missing packages.
-- Leave the PLC disconnected during software setup and image-only testing.
+ผลทดสอบ (ภาพถ่ายจริงจากหน้าจอโปรแกรม, Master จาก PDF): ชิ้นที่ไม่ได้หายวัดได้ "หาย 0%" ทุกตัว
+จับได้: T หายทั้งตัว, ขีดใต้/บน SNI หาย, ขา R หาย
 
-Expected layout on the Pi:
+## อัปเดต (Windows)
+1. ปิดโปรแกรม
+2. วางไฟล์ทั้งหมดทับโฟลเดอร์เดิม
+3. เปิด `RUN_UI.bat` → แท็บ **ตั้งค่า** → กด **คืนค่าเริ่มต้น** (สำคัญ: Tolerance ขั้นต่ำต้องเป็น 2 — ค่า 4 จะทำให้รอยขาดเล็ก ๆ หลุด)
 
-```text
-~/mark_inspection/
-├── mark_ui.py
-├── glyph_check.py
-├── mark_match.py
-├── requirements.txt
-├── setup.sh
-├── run.sh
-├── masters/             # if your existing app uses it
-└── *.json               # your existing model-specific configs, if any
-```
+## ติดตั้งครั้งแรก
+- Windows: `python -m pip install -r requirements-windows.txt` แล้วเปิด `RUN_UI.bat`
+- Pi 5: `bash setup.sh --check-only` → `bash setup.sh` → `bash run.sh`
 
-If you have `plc_out.py` or `find_do_pin.py`, keep those with your existing project, but **do not run or wire the outputs during installation**.
+## วิธีใช้
+1. **Master → PDF/ภาพ…** เลือก PDF CAD FOR ORDER SCREEN (Auto-zoom MARK PATTERN อัตโนมัติ)
+2. แท็บ **กำหนดกรอบ Master** → โซน IGNORE คลุมเลข 1 2 4 8 → **บันทึก** config
+3. **Test → เลือก…** หรือ **ค้นหากล้อง → เปิดกล้อง → 📷 จับภาพ+ตรวจ**
+4. **▶ ตรวจสอบ** — ตาราง "ตารางรายชิ้น" คอลัมน์ "หาย" = % เนื้อหมึกที่หาย
 
-## Install and launch
+## ค่าตั้ง (แท็บตั้งค่า)
+| ค่า | เริ่มต้น | ความหมาย |
+|---|---|---|
+| ส่วนที่หาย กว้าง และ สูง อย่างน้อย | 0.30 | ส่วนที่หายต้องกว้าง ≥30% และสูง ≥30% ของตัวอักษร |
+| เนื้อหมึกหายอย่างน้อย | 0.08 | หมึกหายจริง ≥8% ของตัวอักษร (ตัวปกติวัดได้ ~0%) |
+| Tolerance ขั้นต่ำ px | 2 | อย่าตั้งสูง — ยิ่งสูงยิ่งพลาดรอยขาดเล็ก |
+| Tolerance ตามความหนาเส้น | 0.35 | ยอมให้ขอบเส้นต่างได้ 35% ของความหนาเส้น |
+| ค้นหาตำแหน่งรายตัวอักษร | 0.35 | ยอมให้ตัวอักษรเลื่อนจาก CAD ได้ ±35% ของขนาดตัว |
 
-Open **Terminal on the Pi desktop**, then run:
+ยังฟ้องผิด: เพิ่ม "เนื้อหมึกหายอย่างน้อย" เป็น 0.12 / ยังหลุด: ลดเป็น 0.05
 
-```bash
-cd ~/mark_inspection
-bash setup.sh --check-only
-```
-
-`--check-only` **does not install anything**. If it prints `Missing OS packages: python3-opencv` (or other names), it is reporting what is not installed. A nonzero exit status in that case is intentional. The package name is **`python3-opencv`**, not `pyhon3-opencv`.
-
-Once an approved APT source is available, run:
-
-```bash
-bash setup.sh
-bash run.sh
-```
-
-`setup.sh` checks for the app files, installs missing OS packages via APT, creates `.venv` with access to OS-installed packages, processes `requirements.txt`, checks imports and Python syntax, and stops if a check fails. `bash run.sh` launches the UI from the Pi desktop. Use `bash run.sh` even if the file lost executable permissions during transfer from Windows or USB.
-
-### Why `requirements.txt` does not list OpenCV
-
-The migration helper installs `python3-opencv` (provides `cv2`) and `python3-tk` (provides Tkinter) using APT. Its `requirements.txt` checks NumPy in a virtual environment that can see those OS packages. Do not mix another `opencv-python` wheel into that same environment without first revising and testing the dependency strategy. A `wheels` folder by itself does **not** satisfy the script's APT package check.
-
-## Test in stages
-
-1. **Dependencies:** `bash setup.sh` finishes without an error.
-2. **UI:** `bash run.sh` opens the inspection window on the Pi display.
-3. **Saved images:** load a known Master and known OK/NG Test images. Confirm the displayed result and the correct model-specific config. Config coordinates are valid only for the same Master image and crop dimensions.
-4. **Camera, when available:** connect it and test the live-camera tab. If the app opens a camera using a Windows-only backend, adapt that code for Linux before testing.
-5. **PLC, separately:** have authorized maintenance validate the actual HAT pin mapping, electrical input polarity, changeover reset, fault behavior, and interlock before connecting outputs. **Installation success is not PLC validation.**
-
-## Troubleshooting
-
-### `Missing OS packages: python3-opencv`
-
-If this came from `bash setup.sh --check-only`, it is an **inventory result, not a failed installation**. With IT-approved package access, run `bash setup.sh` without `--check-only`. If that fails, retain the complete output from `apt-get update` or `apt-get install` for diagnosis. Do not assume a downloaded wheel fixes a missing APT package.
-
-### `No module named cv2`
-
-Check that setup completed, then use the app's interpreter:
-
-```bash
-cd ~/mark_inspection
-.venv/bin/python -c "import cv2; print(cv2.__version__)"
-```
-
-If that fails, capture the full error. Do not use `sudo pip install` or `--break-system-packages` as a workaround.
-
-### Existing `.venv` is invalid or hides OS packages
-
-The helper will stop instead of silently using an incompatible environment. Back up or rename `.venv`, then rerun `bash setup.sh`; do not delete an environment containing work you need to keep.
-
-### `bash run.sh` says no graphical desktop
-
-Run it from Terminal **on the Pi desktop**, not from a plain SSH session without graphical forwarding. `setup.sh --check-only` and dependency checks can be run in a terminal session without opening the UI.
-
-## Scope and safety
-
-This guide does not flash an SD card, change display overlays, configure networking, install a background service, or modify PLC logic. Do not treat a simulated OK/NG result or a successful dependency check as permission to run the production line. Keep the existing first-piece and QA approval process in place until the full system has been validated.
+## ข้อจำกัด
+- ทดสอบกับภาพถ่ายที่ได้จากหน้าจอ (ความละเอียดต่ำกว่าไฟล์จริง) — ต้องยืนยันกับภาพ OK จริง 30 ใบ + NG จริง ก่อนใช้งาน
+- ยังไม่ต่อ PLC
