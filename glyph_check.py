@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""glyph_check.py — ตรวจ "องค์ประกอบจางขาดหาย" แบบอัตโนมัติ  (v8: แก้เส้นที่หายถูกข้ามเป็น "ภาพเบลอ")"""
+"""glyph_check.py — ตรวจ "องค์ประกอบจางขาดหาย" แบบอัตโนมัติ
+v8: แก้เส้นที่หายถูกข้ามเป็น "ภาพเบลอ"
+v9: แก้ "ขีดของตัวอักษรหาย แต่ไม่เจอ" (เช่น ขาตั้งของตัว L ใน TEMPERLITE)
+    สาเหตุ: ตอนเลื่อนหาตำแหน่งรายตัวอักษร (local search) ตัวอักษรไป "ยืมหมึก" ของตัวข้างเคียง
+            (ขาตั้งของ L ที่หาย ไปทับปลายแขนของตัว E ที่อยู่ติดกัน) -> วัดได้ว่าหายแค่ 5%
+    แก้:   แต่ละตัวอักษรใช้หมึกได้เฉพาะ "เขตของตัวเอง" (พื้นที่ที่ใกล้ตัวนั้นที่สุด)
+            หมึกของตัวข้างเคียงไม่ถูกนำมานับแทน"""
 import argparse, json, os
 from datetime import datetime
 import numpy as np
@@ -97,8 +103,37 @@ def mark_dash_groups(els, img_w, img_h, min_count=4, gap_cv_max=0.6,
                     e["kind"] = "DASH"
 
 
-def extent_fractions(el, test_mask, tol_px=2, loss_density=0.60, local_search=0, stroke_tol=0.0):
+def element_zones(mmask, els):
+    """
+    v9: แบ่งภาพเป็น "เขต" ของแต่ละชิ้นส่วน = พิกเซลที่อยู่ใกล้ชิ้นนั้นมากกว่าชิ้นอื่น
+    คืน (zone_label_map, {element_id: label})
+    """
+    src = np.where(mmask > 0, 0, 255).astype(np.uint8)          # หมึก = 0
+    _, zl = cv2.distanceTransformWithLabels(src, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_CCOMP)
+    lab_of = {}
+    for e in els:
+        ys, xs = np.nonzero(e["mask"])
+        if len(xs):
+            lab_of[e["id"]] = int(zl[e["y"] + ys[0], e["x"] + xs[0]])
+    return zl, lab_of
+
+
+def extent_fractions(el, test_mask, tol_px=2, loss_density=0.60, local_search=0, stroke_tol=0.0,
+                     zone_map=None, zone_label=None):
     x, y, w, h = el["x"], el["y"], el["w"], el["h"]
+    if zone_map is not None and zone_label is not None:
+        # v9: ใช้เฉพาะหมึกใน "เขตของตัวเอง" — ไม่ยืมหมึกของตัวข้างเคียง
+        #     ขยายเขตออกเล็กน้อย (~1/4 ความหนาเส้น) เผื่อภาพถ่ายเลื่อน/เส้นหนากว่า Master
+        Hz, Wz = zone_map.shape
+        g = max(2, int(round(0.25 * float(el.get("stroke", 4.0)))))
+        p = g + 30
+        zx0, zy0 = max(0, x - p), max(0, y - p)
+        zx1, zy1 = min(Wz, x + el["w"] + p), min(Hz, y + el["h"] + p)
+        own = (zone_map[zy0:zy1, zx0:zx1] == zone_label).astype(np.uint8)
+        own = cv2.dilate(own, np.ones((2 * g + 1,) * 2, np.uint8))
+        tm2 = np.zeros_like(test_mask)
+        tm2[zy0:zy1, zx0:zx1] = np.where(own > 0, test_mask[zy0:zy1, zx0:zx1], 0)
+        test_mask = tm2
     m = (el["mask"] > 0).astype(np.uint8)
     stroke = float(el.get("stroke", 4.0))
     tol = int(round(max(tol_px, stroke_tol * stroke)))
@@ -167,11 +202,6 @@ def background_noise_std(gray, patch=50):
 
 
 def _ink_darkness(gray, el, pad=6, k=5):
-    """
-    ความเข้มของหมึก "ตามรูปร่างชิ้นส่วน" = ความสว่างพื้นหลังรอบ ๆ − ความสว่างตรงตำแหน่งเส้น
-    ใช้ min-filter เล็ก ๆ (k px) ให้ทนการเลื่อนตำแหน่งเล็กน้อย/ภาพเบลอ
-    แต่ไม่กว้างพอจะไปดึงหมึกของตัวอักษรข้างเคียงมานับ
-    """
     H, W = gray.shape
     x, y, w, h = el["x"], el["y"], el["w"], el["h"]
     x0, y0 = max(0, x - pad), max(0, y - pad)
@@ -187,13 +217,6 @@ def _ink_darkness(gray, el, pad=6, k=5):
 
 
 def is_blurred(el, master_bgr, aligned_bgr, baseline, bg_std, blur_rel_thr=0.35, ink_thr=0.15):
-    """
-    v8: "เบลอ" = คมชัดน้อยกว่าปกติ **และ** ยังมีหมึกเข้มอยู่ตามแนวรูปร่างของชิ้นนั้น
-        เดิมดูแค่ความแปรปรวนของทั้งกรอบ -> เส้นขีดใต้ SNI ที่หายไป (เหลือพื้นเปล่า)
-        แต่มีตัว S N I อยู่ในกรอบใกล้ ๆ ก็ถูกเข้าใจว่า "เบลอ" แล้วข้ามไป
-        ตอนนี้ถ้าตำแหน่งเส้นเป็นพื้นเปล่า (หมึก < ink_thr ของ Master) = หายจริง ไม่ข้าม
-    คืน (is_blur, sharp_rel, ink_ratio)
-    """
     gm, gt = _crop(master_bgr, el), _crop(aligned_bgr, el)
     sm = _sharp(gm)
     if sm < 6.0 or baseline <= 0:
@@ -236,11 +259,12 @@ def mask_out(mask, zones):
 DEFAULT_P = dict(
     min_extent=0.30, min_loss=0.08, row_loss_thr=0.60, miss_full=0.25,
     local_search=0.35, stroke_tol=0.35,
-    check_blur=True, blur_rel_thr=0.35, ink_thr=0.15,   # v8: หมึกตามแนวเส้น <15% ของ Master = หายจริง ไม่ใช่เบลอ
+    check_blur=True, blur_rel_thr=0.35, ink_thr=0.15,
     check_dash=True, dash_edge_ratio=0.07, dash_min_count=4,
     dash_gap_cv_max=0.6, dash_area_percentile=70,
     min_area=40, merge_gap=0, tol_px=2,
     check_extra=True, extra_area=120,
+    own_zone=True,   # v9: ตัวอักษรใช้หมึกได้เฉพาะเขตของตัวเอง (False = แบบ v8)
 )
 
 
@@ -255,6 +279,7 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
     els = segment_elements(mmask, p["min_area"], p["merge_gap"],
                            dp if p["check_dash"] else dict(min_count=10 ** 9))
     base = sharpness_baseline(els, master_bgr, aligned) if p["check_blur"] else 1.0
+    zmap, zlab = element_zones(mmask, els) if p["own_zone"] else (None, {})
     bg_std = background_noise_std(cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY))
     rows, ng, n_blur, n_dash = [], 0, 0, 0
     for el in els:
@@ -277,7 +302,8 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
                 status, note = "SKIP", f"ภาพเบลอ (คมชัด {rel:.0%}, หมึกยังอยู่ {con:.0%}) — ข้าม"; n_blur += 1
             else:
                 cov, vfrac, hfrac, off = extent_fractions(
-                    el, tmask, p["tol_px"], p["row_loss_thr"], float(p["local_search"]), p["stroke_tol"])
+                    el, tmask, p["tol_px"], p["row_loss_thr"], float(p["local_search"]), p["stroke_tol"],
+                    zmap, zlab.get(el["id"]))
                 status, note = judge(cov, vfrac, hfrac, p)
                 ng += status != "OK"
         rows.append(dict(id=el["id"], kind=el["kind"], status=status, note=note,
