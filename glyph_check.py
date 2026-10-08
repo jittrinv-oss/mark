@@ -1,21 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-glyph_check.py — ตรวจ "องค์ประกอบจางขาดหาย" แบบอัตโนมัติ  (v7)
-
-v7 แก้ปัญหา "ตัวอักษรปกติ (H, 2, M, T) ขึ้นสีส้ม" เมื่อใช้ Master จาก PDF กับภาพถ่ายจริง
-สาเหตุ:
-  ก) ภาพถ่ายจริงเลนส์โค้ง/กระดาษไม่เรียบ -> homography ตัวเดียวทั้งภาพจัดตำแหน่งได้
-     ไม่ตรงทุกจุด บางตัวอักษรเลื่อน 3-8 px -> ขอบตัวอักษรถูกนับว่า "หาย"
-  ข) เส้นใน PDF (vector) กับเส้นในภาพถ่าย หนา-บางต่างกัน -> tolerance ตายตัว 2-4 px ไม่พอ
-  ค) เกณฑ์ PARTIAL เดิมดูแค่ "ขอบเขต" ของส่วนที่หาย (แนวตั้ง/แนวนอน) ไม่ดูว่าหายไปจริงกี่ %
-     ขอบบาง ๆ รอบตัวอักษรที่หลุดแนว ก็ทำให้ขอบเขตกว้างพอจะฟ้องได้
-แก้:
-  1) Local re-align: แต่ละชิ้นส่วนหา offset ที่ดีที่สุดในรัศมี ±local_search px ก่อนวัด
-  2) Tolerance ตามความหนาเส้น: tol = max(tol_px, stroke_tol × ความหนาเส้นของชิ้นนั้น)
-  3) ต้องหมึกหายจริงอย่างน้อย min_loss (ค่าเริ่ม 25%) ของชิ้น ถึงจะเป็น PARTIAL
-  4) หมึกเกิน (สีม่วง) ไม่นับบริเวณขอบภาพที่เกิดจากการ warp
-"""
+"""glyph_check.py — ตรวจ "องค์ประกอบจางขาดหาย" แบบอัตโนมัติ  (v8: แก้เส้นที่หายถูกข้ามเป็น "ภาพเบลอ")"""
 import argparse, json, os
 from datetime import datetime
 import numpy as np
@@ -24,9 +9,6 @@ import cv2
 from mark_match import to_ink_mask, align
 
 
-# =====================================================================
-# 1) แยกชิ้นส่วนจาก Master
-# =====================================================================
 def segment_elements(mask, min_area=40, merge_gap=0, dash_params=None):
     work = mask
     if merge_gap > 0:
@@ -44,7 +26,7 @@ def segment_elements(mask, min_area=40, merge_gap=0, dash_params=None):
         if a < min_area:
             continue
         d = dist[y:y + h, x:x + w][sub > 0]
-        stroke = float(2 * np.percentile(d, 90)) if d.size else 2.0   # ความหนาเส้นโดยประมาณ
+        stroke = float(2 * np.percentile(d, 90)) if d.size else 2.0
         els.append(dict(id=0, x=x, y=y, w=w, h=h, area=a, stroke=stroke,
                         cx=x + w / 2, cy=y + h / 2, mask=sub, kind=None))
     if els:
@@ -95,7 +77,6 @@ def _is_regular(vals, cv_max):
 
 def mark_dash_groups(els, img_w, img_h, min_count=4, gap_cv_max=0.6,
                      edge_ratio=0.07, area_percentile=70):
-    """ขีดบาง ๆ เรียงระยะสม่ำเสมอที่ริมขอบภาพ = เส้นประ/สเกล -> kind='DASH'"""
     if not els:
         return
     max_area = max(60.0, float(np.percentile([e["area"] for e in els], area_percentile)))
@@ -116,25 +97,11 @@ def mark_dash_groups(els, img_w, img_h, min_count=4, gap_cv_max=0.6,
                     e["kind"] = "DASH"
 
 
-# =====================================================================
-# 2) วัดการหาย (v7: local re-align + tolerance ตามความหนาเส้น)
-# =====================================================================
 def extent_fractions(el, test_mask, tol_px=2, loss_density=0.60, local_search=0, stroke_tol=0.0):
-    """
-    คืน (cov, vfrac, hfrac, (dx, dy))
-    v7 หลักการ:
-      1) Local re-align: เลื่อนชิ้นส่วนของ Master ไปรอบ ๆ ±local_search px
-         แล้วเลือกตำแหน่งที่ "หมึกทับกันมากที่สุด" (นับพิกเซลจริง ไม่ใช่ประมาณ)
-         -> ภาพถ่ายบิดเบี้ยวเล็กน้อยจะไม่ถูกนับว่าหมึกหาย
-         ส่วนที่หายจริง ไม่ว่าเลื่อนไปทางไหนก็ไม่มีหมึกมาเติม จึงยังถูกจับได้
-      2) Tolerance ตามความหนาเส้น
-      3) "หายจริง = เนื้อเส้นหายทั้งความหนา": ลบเศษบาง ๆ ตามขอบเส้นด้วย opening
-    """
     x, y, w, h = el["x"], el["y"], el["w"], el["h"]
     m = (el["mask"] > 0).astype(np.uint8)
     stroke = float(el.get("stroke", 4.0))
     tol = int(round(max(tol_px, stroke_tol * stroke)))
-    # รัศมีค้นหา: สัดส่วนของขนาดชิ้น (ภาพถ่ายจริง ระยะห่างตัวอักษรอาจต่างจาก CAD หลาย px)
     s = int(min(15, max(3, local_search * min(w, h)))) if local_search else 0
     Ht, Wt = test_mask.shape
     pad = tol + s + 2
@@ -146,7 +113,6 @@ def extent_fractions(el, test_mask, tol_px=2, loss_density=0.60, local_search=0,
         canvas[cy0 - Y0:cy1 - Y0, cx0 - X0:cx1 - X0] = (test_mask[cy0:cy1, cx0:cx1] > 0)
     if tol > 0:
         canvas = cv2.dilate(canvas, np.ones((2 * tol + 1,) * 2, np.uint8))
-    # เลือก offset ที่ทับกันมากที่สุด (เท่ากันให้เลือกที่เลื่อนน้อยสุด)
     dx = dy = 0
     if s > 0:
         win = canvas[pad - s:pad + h + s, pad - s:pad + w + s].astype(np.float32)
@@ -171,9 +137,6 @@ def extent_fractions(el, test_mask, tol_px=2, loss_density=0.60, local_search=0,
     return float(cov), (ys.max() - ys.min() + 1) / h, (xs.max() - xs.min() + 1) / w, (dx, dy)
 
 
-# =====================================================================
-# 3) ภาพเบลอ
-# =====================================================================
 def _sharp(g):
     return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
@@ -203,19 +166,47 @@ def background_noise_std(gray, patch=50):
     return float(np.median(v))
 
 
-def is_blurred(el, master_bgr, aligned_bgr, baseline, bg_std, blur_rel_thr=0.35, content_factor=3.0):
+def _ink_darkness(gray, el, pad=6, k=5):
+    """
+    ความเข้มของหมึก "ตามรูปร่างชิ้นส่วน" = ความสว่างพื้นหลังรอบ ๆ − ความสว่างตรงตำแหน่งเส้น
+    ใช้ min-filter เล็ก ๆ (k px) ให้ทนการเลื่อนตำแหน่งเล็กน้อย/ภาพเบลอ
+    แต่ไม่กว้างพอจะไปดึงหมึกของตัวอักษรข้างเคียงมานับ
+    """
+    H, W = gray.shape
+    x, y, w, h = el["x"], el["y"], el["w"], el["h"]
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(W, x + w + pad), min(H, y + h + pad)
+    crop = gray[y0:y1, x0:x1]
+    if crop.size == 0:
+        return 0.0
+    dark = cv2.erode(crop, np.ones((k, k), np.uint8))
+    m = np.zeros(crop.shape, bool)
+    m[y - y0:y - y0 + h, x - x0:x - x0 + w] = el["mask"] > 0
+    bg = float(np.percentile(crop, 90))
+    return max(0.0, bg - float(dark[m].mean())) if m.any() else 0.0
+
+
+def is_blurred(el, master_bgr, aligned_bgr, baseline, bg_std, blur_rel_thr=0.35, ink_thr=0.15):
+    """
+    v8: "เบลอ" = คมชัดน้อยกว่าปกติ **และ** ยังมีหมึกเข้มอยู่ตามแนวรูปร่างของชิ้นนั้น
+        เดิมดูแค่ความแปรปรวนของทั้งกรอบ -> เส้นขีดใต้ SNI ที่หายไป (เหลือพื้นเปล่า)
+        แต่มีตัว S N I อยู่ในกรอบใกล้ ๆ ก็ถูกเข้าใจว่า "เบลอ" แล้วข้ามไป
+        ตอนนี้ถ้าตำแหน่งเส้นเป็นพื้นเปล่า (หมึก < ink_thr ของ Master) = หายจริง ไม่ข้าม
+    คืน (is_blur, sharp_rel, ink_ratio)
+    """
     gm, gt = _crop(master_bgr, el), _crop(aligned_bgr, el)
     sm = _sharp(gm)
     if sm < 6.0 or baseline <= 0:
         return False, 1.0, 1.0
     rel = (_sharp(gt) / sm) / baseline
-    content = float(gt.std()) / max(bg_std, 1e-6)
-    return (rel < blur_rel_thr and content > content_factor), rel, content
+    if rel >= blur_rel_thr:
+        return False, rel, 1.0
+    g_m = cv2.cvtColor(master_bgr, cv2.COLOR_BGR2GRAY)
+    g_t = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2GRAY)
+    ink_ratio = _ink_darkness(g_t, el) / max(_ink_darkness(g_m, el), 1.0)
+    return ink_ratio >= ink_thr, rel, ink_ratio
 
 
-# =====================================================================
-# 4) ตัดสิน
-# =====================================================================
 def judge(cov, vfrac, hfrac, p):
     loss = 1.0 - cov
     if vfrac < p["min_extent"] or hfrac < p["min_extent"] or loss < p["min_loss"]:
@@ -243,13 +234,9 @@ def mask_out(mask, zones):
 
 
 DEFAULT_P = dict(
-    min_extent=0.30,      # ส่วนที่หายต้องกว้าง ≥30% และสูง ≥30% ของชิ้น
-    min_loss=0.08,        # v7: เนื้อหมึกต้องหายจริง ≥8% ของชิ้น (ชิ้นปกติวัดได้ ~0%)
-    row_loss_thr=0.60,    # ความหนาแน่นการหายภายในบริเวณที่หาย
-    miss_full=0.25,       # เหลือ <25% = หายทั้งชิ้น
-    local_search=0.35,    # v7: ค้นหาตำแหน่งชิ้นส่วนรอบ ๆ ±35% ของขนาดชิ้น (แก้ภาพถ่ายบิดเบี้ยว)
-    stroke_tol=0.35,      # v7: tolerance = 35% ของความหนาเส้น (อย่างน้อย tol_px)
-    check_blur=True, blur_rel_thr=0.35, content_factor=3.0,
+    min_extent=0.30, min_loss=0.08, row_loss_thr=0.60, miss_full=0.25,
+    local_search=0.35, stroke_tol=0.35,
+    check_blur=True, blur_rel_thr=0.35, ink_thr=0.15,   # v8: หมึกตามแนวเส้น <15% ของ Master = หายจริง ไม่ใช่เบลอ
     check_dash=True, dash_edge_ratio=0.07, dash_min_count=4,
     dash_gap_cv_max=0.6, dash_area_percentile=70,
     min_area=40, merge_gap=0, tol_px=2,
@@ -269,7 +256,6 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
                            dp if p["check_dash"] else dict(min_count=10 ** 9))
     base = sharpness_baseline(els, master_bgr, aligned) if p["check_blur"] else 1.0
     bg_std = background_noise_std(cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY))
-
     rows, ng, n_blur, n_dash = [], 0, 0, 0
     for el in els:
         cov = vfrac = hfrac = None
@@ -286,9 +272,9 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
             blur, rel, con = (False, 1, 1)
             if p["check_blur"]:
                 blur, rel, con = is_blurred(el, master_bgr, aligned, base, bg_std,
-                                            p["blur_rel_thr"], p["content_factor"])
+                                            p["blur_rel_thr"], p["ink_thr"])
             if blur:
-                status, note = "SKIP", f"ภาพเบลอ (คมชัด {rel:.0%} ของปกติ) — ข้าม"; n_blur += 1
+                status, note = "SKIP", f"ภาพเบลอ (คมชัด {rel:.0%}, หมึกยังอยู่ {con:.0%}) — ข้าม"; n_blur += 1
             else:
                 cov, vfrac, hfrac, off = extent_fractions(
                     el, tmask, p["tol_px"], p["row_loss_thr"], float(p["local_search"]), p["stroke_tol"])
@@ -300,7 +286,6 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
                          cov=None if cov is None else round(cov, 3),
                          vfrac=None if vfrac is None else round(vfrac, 3),
                          hfrac=None if hfrac is None else round(hfrac, 3)))
-
     extras = []
     if p["check_extra"]:
         tol = max(p["tol_px"], 6)
@@ -309,7 +294,6 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
         n, _, st, _ = cv2.connectedComponentsWithStats(ex, 8)
         extras = [dict(x=int(st[i, 0]), y=int(st[i, 1]), w=int(st[i, 2]), h=int(st[i, 3]),
                        area=int(st[i, 4])) for i in range(1, n) if st[i, 4] >= p["extra_area"]]
-
     rep = dict(timestamp=datetime.now().isoformat(timespec="seconds"),
                verdict="NG" if ng else "OK", align_method=method, align_inliers=inl,
                n_elements=len(els),
@@ -359,22 +343,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--master", required=True); ap.add_argument("--test", required=True)
     ap.add_argument("--ignore"); ap.add_argument("--out", default="res_glyph")
-    ap.add_argument("--set", nargs="*", default=[], help="เช่น --set min_loss=0.3 local_search=0")
+    ap.add_argument("--set", nargs="*", default=[])
     a = ap.parse_args()
     rd = lambda f: cv2.imdecode(np.fromfile(f, np.uint8), cv2.IMREAD_COLOR)
     zones = json.load(open(a.ignore, encoding="utf-8")).get("ignore", []) if a.ignore else []
     params = {}
     for kv in a.set:
         k, v = kv.split("=")
-        params[k] = type(DEFAULT_P[k])(float(v)) if not isinstance(DEFAULT_P[k], bool) else v in ("1", "True", "true")
+        params[k] = (v in ("1", "True", "true")) if isinstance(DEFAULT_P[k], bool) else type(DEFAULT_P[k])(float(v))
     rep, ov, *_ = inspect_glyph(rd(a.master), rd(a.test), zones, params)
     os.makedirs(a.out, exist_ok=True)
     cv2.imencode(".png", ov)[1].tofile(os.path.join(a.out, "overlay.png"))
     json.dump(rep, open(os.path.join(a.out, "report.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
     print(f'RESULT = {rep["verdict"]}  align={rep["align_method"]}  ชิ้น={rep["n_elements"]} '
-          f'MISSING={rep["n_missing"]} PARTIAL={rep["n_partial"]} SKIP={rep["n_skip"]} EXTRA={rep["n_extra"]}')
+          f'MISSING={rep["n_missing"]} PARTIAL={rep["n_partial"]} SKIP={rep["n_skip"]} '
+          f'(blur={rep["n_blur"]} dash={rep["n_dash"]})')
     for r in rep["elements"]:
-        if r["status"] in ("MISSING", "PARTIAL"):
+        if r["status"] != "OK":
             print(f'  [{r["status"]}] #{r["id"]} {r["kind"]} ({r["x"]},{r["y"]}) {r["w"]}x{r["h"]} {r["note"]}')
 
 
