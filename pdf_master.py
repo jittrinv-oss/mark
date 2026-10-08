@@ -3,11 +3,14 @@
 """
 pdf_master.py — โหลด "CAD FOR ORDER SCREEN" (PDF) แล้ว Auto-zoom เฉพาะ MARK PATTERN
 
-  1) หา "กรอบเส้นประสีแดง" ที่ล้อมมาร์ค
-     - ทางหลัก: อ่านเส้น vector สีแดงจาก PDF โดยตรง (แม่นยำ คมชัดที่สุด)
-     - ทางสำรอง: render เป็นภาพแล้วหากรอบสีแดง (PDF สแกน / ไม่มี PyMuPDF)
+v7.1: แก้ error "orphaned object: parent is None" (PyMuPDF รุ่นใหม่ บน Raspberry Pi)
+      สาเหตุ: เดิมเขียน  page = fitz.open(path)[0]  -> เอกสาร (doc) ถูกปิด/ลบทิ้งทันที
+              เหลือแต่ page ที่ไม่มีเอกสารแม่ -> PyMuPDF รุ่นใหม่ไม่ยอมให้ใช้
+      แก้:   เก็บ doc ไว้ในตัวแปรตลอดการใช้งาน แล้วปิดเมื่อใช้เสร็จ (with ... as doc)
+
+  1) หา "กรอบเส้นประสีแดง" ที่ล้อมมาร์ค (อ่านเส้น vector จาก PDF / สำรอง: หาจากภาพ)
      เจอหลายกรอบ -> เลือกกรอบใหญ่สุด = ช่อง MARK PATTERN
-  2) Render เฉพาะบริเวณนั้นความละเอียดสูง (ไม่ใช่ขยายภาพ -> ไม่แตก)
+  2) Render เฉพาะบริเวณนั้นความละเอียดสูง
   3) เก็บส่วนที่อยู่นอกกรอบประ เช่น "T1" แต่ตัดเส้นตาราง/หัวข้อรอบ ๆ ออก
   4) ลบเส้นประสีแดงออก -> ภาพมาร์คขาวดำ ใช้เป็น Master ได้ทันที
 
@@ -44,9 +47,9 @@ def find_red_dashed_boxes_vector(page, min_side=15.0, min_segments=8, gap=6.0):
         if _is_red(d.get("color")) and d.get("fill") is None:
             r = d["rect"]
             if max(r.width, r.height) < 60:
-                segs.append([r.x0, r.y0, r.x1, r.y1])          # เส้นประที่วาดเป็นท่อน ๆ
+                segs.append([r.x0, r.y0, r.x1, r.y1])
             elif d.get("dashes") not in (None, "", "[] 0") and min(r.width, r.height) >= min_side:
-                whole.append(fitz.Rect(r))                      # สี่เหลี่ยมเส้นประชิ้นเดียว
+                whole.append(fitz.Rect(r))
     if not segs:
         whole.sort(key=lambda r: r.width * r.height, reverse=True)
         return whole
@@ -103,7 +106,7 @@ def find_red_boxes_raster(bgr, min_side=40):
         sides = [m[y:y + h, x:x + b].max(axis=1), m[y:y + h, x + w - b:x + w].max(axis=1),
                  m[y:y + b, x:x + w].max(axis=0), m[y + h - b:y + h, x:x + w].max(axis=0)]
         cover = min(float((s > 0).mean()) for s in sides)
-        if inside.size and inside.mean() < 40 and cover > 0.6:   # กรอบกลวงครบ 4 ด้าน
+        if inside.size and inside.mean() < 40 and cover > 0.6:
             boxes.append((x, y, w, h))
     boxes.sort(key=lambda b_: b_[2] * b_[3], reverse=True)
     return boxes
@@ -117,7 +120,6 @@ def _remove_long_lines(ink, frac=0.45):
 
 
 def tight_crop_mark(bgr, box_px, side_margin=0.30, pad=0.04):
-    """เก็บหมึกในกรอบ + นอกกรอบไม่เกิน side_margin (เช่น T1) แล้วครอบตัดพอดี"""
     x, y, w, h = box_px
     clean = bgr.copy()
     clean[red_mask(clean) > 0] = (255, 255, 255)
@@ -144,7 +146,7 @@ def tight_crop_mark(bgr, box_px, side_margin=0.30, pad=0.04):
 def _render_fitz(page, clip, long_side_px):
     scale = long_side_px / max(clip.width, clip.height)
     pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
-    img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+    img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n).copy()
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR if pix.n == 3 else cv2.COLOR_GRAY2BGR), scale
 
 
@@ -166,22 +168,7 @@ def _resize_long(img, long_side):
                       interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
 
 
-def load_pdf_mark(path, page_no=0, target_long_side=1000):
-    """คืน (mark_bgr, info) — raise RuntimeError ถ้าหากรอบไม่เจอ"""
-    if HAVE_FITZ:
-        page = fitz.open(path)[page_no]
-        boxes = find_red_dashed_boxes_vector(page)
-        if boxes:
-            box = boxes[0]
-            mx, my = box.width * 0.45, box.height * 0.10
-            clip = fitz.Rect(box.x0 - mx, box.y0 - my, box.x1 + mx, box.y1 + my) & page.rect
-            img, s = _render_fitz(page, clip, target_long_side * 1.9)
-            bx = (int((box.x0 - clip.x0) * s), int((box.y0 - clip.y0) * s), int(box.width * s), int(box.height * s))
-            mark, _ = tight_crop_mark(img, bx)
-            return _resize_long(mark, target_long_side), dict(method="PDF-vector", n_boxes=len(boxes), page=page_no)
-        img, _ = _render_fitz(page, page.rect, 6000)
-    else:
-        img = _render_pdftoppm(path, 200, page_no + 1)
+def _from_raster(img):
     boxes = find_red_boxes_raster(img)
     if not boxes:
         raise RuntimeError("ไม่พบกรอบเส้นประสีแดงรอบมาร์คใน PDF — ใช้การลากกรอบครอบตัดเองแทน")
@@ -190,7 +177,32 @@ def load_pdf_mark(path, page_no=0, target_long_side=1000):
     ex0, ey0 = max(0, int(x - w * 0.45)), max(0, int(y - h * 0.10))
     ex1, ey1 = min(W, int(x + w * 1.45)), min(H, int(y + h * 1.10))
     mark, _ = tight_crop_mark(img[ey0:ey1, ex0:ex1], (x - ex0, y - ey0, w, h))
-    return _resize_long(mark, target_long_side), dict(method="PDF-raster", n_boxes=len(boxes), page=page_no)
+    return mark, len(boxes)
+
+
+def load_pdf_mark(path, page_no=0, target_long_side=1000):
+    """คืน (mark_bgr, info) — raise RuntimeError ถ้าหากรอบไม่เจอ"""
+    if HAVE_FITZ:
+        doc = fitz.open(path)                      # v7.1: เก็บ doc ไว้ ไม่ให้ถูกลบระหว่างใช้ page
+        try:
+            page = doc[page_no]
+            boxes = find_red_dashed_boxes_vector(page)
+            if boxes:
+                box = boxes[0]
+                mx, my = box.width * 0.45, box.height * 0.10
+                clip = fitz.Rect(box.x0 - mx, box.y0 - my, box.x1 + mx, box.y1 + my) & page.rect
+                img, s = _render_fitz(page, clip, target_long_side * 1.9)
+                bx = (int((box.x0 - clip.x0) * s), int((box.y0 - clip.y0) * s),
+                      int(box.width * s), int(box.height * s))
+                mark, _ = tight_crop_mark(img, bx)
+                return _resize_long(mark, target_long_side), dict(method="PDF-vector", n_boxes=len(boxes), page=page_no)
+            img, _ = _render_fitz(page, page.rect, 6000)
+        finally:
+            doc.close()
+    else:
+        img = _render_pdftoppm(path, 200, page_no + 1)
+    mark, n = _from_raster(img)
+    return _resize_long(mark, target_long_side), dict(method="PDF-raster", n_boxes=n, page=page_no)
 
 
 if __name__ == "__main__":
