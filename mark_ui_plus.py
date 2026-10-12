@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mark_ui_plus.py — โปรแกรมตรวจมาร์คเดิม (mark_ui.py) + ส่วนเสริม  [plus v6]
+mark_ui_plus.py — โปรแกรมตรวจมาร์คเดิม (mark_ui.py) + ส่วนเสริม  [plus v7]
 ไม่แก้ไขไฟล์เดิม:
-  1) มาร์คบนสกรีนสี (test_polarity.py v2) — แปลง Master+Test, ตัดแผ่นสกรีน, ขยาย Test
+  1) มาร์คบนสกรีนสี (test_polarity.py) — แปลง Master+Test เป็นขาวดำ
   2) ช่อง "โมเดล" — เก็บผลแยกโฟลเดอร์ตามโมเดล (จำโมเดลล่าสุด)
   3) บันทึกผลอัตโนมัติ: results/<โมเดล>/YYYYMMDD/HHMMSS_OK|NG/
-         1_master.png 2_test.png 3_result.png report.json + log.csv, log_all.csv
   4) ปุ่ม "เปิดโฟลเดอร์ผล"
-  5) ปุ่ม "📷 ถ่ายเป็น Master" — ใช้ภาพกล้องเป็น Master (บันทึกที่ results/<โมเดล>/masters/)
-  6) v6: ปุ่ม "📄 Test จาก PDF" — เลือก PDF (Order screen) แล้วโปรแกรมหามาร์คเอง
-         + zoom + กลับด้าน (mirror) + หมุน ให้ตรงกับ Master อัตโนมัติ (pdf_autofind.py)
+  5) ปุ่ม "📷 ถ่ายเป็น Master"
+  6) ปุ่ม "📄 Test จาก PDF" + ปุ่ม Test "เลือก…" เลือก PDF ได้ (pdf_autofind.py)
+  7) v7: - ป้าย OK / NG ตัวใหญ่ ด้านขวาของแถบด้านบน
+         - กรอบช่อง "ผลตรวจ" เป็นสีเขียว (OK) / แดง (NG) หนาชัด
+         - ปุ่มพื้นเหลือง ตัวหนังสือดำ (อ่านง่ายกว่าพื้นน้ำเงิน)
 """
 import csv
 import json
@@ -23,6 +24,7 @@ import tkinter as tk
 from tkinter import ttk
 
 import cv2
+import numpy as np
 
 import mark_ui
 from test_polarity import MODES, prepare_pair
@@ -36,6 +38,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 PLUS_SETTINGS = os.path.join(BASE_DIR, "plus_settings.json")
 NO_MODEL = "_ไม่ระบุโมเดล"
+
+YELLOW, YELLOW_D, BLACK = "#FFD60A", "#E6BE00", "#000000"
+OK_GREEN, NG_RED, IDLE_GREY = "#1a9e3c", "#d62828", "#9aa5b1"
 
 
 def safe_model_name(name):
@@ -74,11 +79,13 @@ class AppPlus(mark_ui.App):
         self.pol_mode = None
         self.auto_save = None
         self.model = None
+        self.big_verdict = None
         self._pol_msg = ""
         self._raw_test = None
         self._raw_master = None
         super().__init__()
         self.title(mark_ui.APP + "  (+ สกรีนสี, โมเดล, บันทึกผล, Test จาก PDF)")
+        self._yellow_buttons()
         saved = self._load_plus()
         self.pol_mode = tk.StringVar(value=MODES[0])
         self.auto_save = tk.BooleanVar(value=saved.get("auto_save", True))
@@ -105,6 +112,51 @@ class AppPlus(mark_ui.App):
             bar.pack(fill="x", padx=6, before=nbs[0])
         else:
             bar.pack(fill="x", padx=6)
+        self._build_big_verdict()
+
+    # ---------------------------------------------------------- หน้าตา (v7)
+    def _yellow_buttons(self):
+        """ปุ่มพื้นเหลือง ตัวหนังสือดำ (ปุ่ม ▶ ตรวจสอบ สีเขียวเหมือนเดิม)"""
+        try:
+            st = ttk.Style(self)
+            st.configure("TButton", background=YELLOW, foreground=BLACK,
+                         bordercolor="#b8960a", lightcolor=YELLOW, darkcolor=YELLOW_D)
+            st.map("TButton",
+                   background=[("pressed", YELLOW_D), ("active", "#FFE45C"), ("disabled", "#d9d9d9")],
+                   foreground=[("disabled", "#888888"), ("!disabled", BLACK)])
+        except Exception:
+            pass
+
+    def _build_big_verdict(self):
+        """ป้าย OK / NG ตัวใหญ่ ด้านขวาของแถบด้านบน (พื้นที่ว่าง) — ใต้หัวโปรแกรม"""
+        old = self.__dict__.get("verdict")
+        parent = getattr(old, "master", None) if old is not None else None
+        if parent is None or not hasattr(parent, "pack_slaves"):
+            parent = self
+        try:
+            self.big_verdict = tk.Label(parent, text="—", font=mark_ui.F(40, "bold"),
+                                        fg="white", bg=IDLE_GREY, width=5, padx=18,
+                                        relief="flat", bd=0)
+            self.big_verdict.pack(side="right", padx=(10, 14), pady=2, ipady=2)
+        except Exception:
+            self.big_verdict = None
+
+    def _show_verdict(self, verdict):
+        ok = verdict == "OK"
+        color = OK_GREEN if ok else (NG_RED if verdict == "NG" else IDLE_GREY)
+        if self.big_verdict is not None:
+            try:
+                self.big_verdict.config(text=verdict or "—", bg=color)
+            except Exception:
+                pass
+        pn = self.__dict__.get("pn_result")
+        if pn is not None:
+            try:
+                pn.config(highlightbackground=color, highlightcolor=color, highlightthickness=8)
+                if hasattr(pn, "title_var"):
+                    pn.title_var.set(f"ผลตรวจ : {verdict}" if verdict else "ผลตรวจ")
+            except Exception:
+                pass
 
     # ---------------------------------------------------------- โมเดล
     def _known_models(self):
@@ -165,19 +217,48 @@ class AppPlus(mark_ui.App):
         self.status.set(f"ตั้ง Master จากกล้องแล้ว — บันทึกที่ {os.path.relpath(path, BASE_DIR)}"
                         "   |   ลากโซน IGNORE ใหม่ แล้วกด 'บันทึก' config")
 
-    # ---------------------------------------------------------- Test จาก PDF
-    def test_from_pdf(self):
+    # ---------------------------------------------------------- เลือก Test (ภาพ หรือ PDF)
+    def _show_test(self, img, path, title):
+        if getattr(self, "live", False) and hasattr(self, "toggle_camera"):
+            self.toggle_camera()
+        self.test_img = img
+        self.test_path.set(path)
+        self._show_verdict("")
+        pn = self.__dict__.get("pn_test")
+        if pn is not None and hasattr(pn, "title_var"):
+            pn.title_var.set(title)
+            pn.set(img)
+
+    def pick_test(self):
+        """ปุ่ม Test 'เลือก…' เลือกได้ทั้งภาพ และ PDF"""
+        from tkinter import filedialog, messagebox
+        p = filedialog.askopenfilename(
+            title="เลือก Test (ภาพ หรือ PDF)",
+            filetypes=[("ภาพ / PDF", "*.png *.jpg *.jpeg *.bmp *.pdf"),
+                       ("PDF", "*.pdf"), ("Image", "*.png *.jpg *.jpeg *.bmp")])
+        if not p:
+            return
+        if p.lower().endswith(".pdf"):
+            return self.test_from_pdf(p)
+        img = cv2.imdecode(np.fromfile(p, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            messagebox.showerror(mark_ui.APP, "อ่านภาพไม่ได้")
+            return
+        self._show_test(img, p, "Test (ชิ้นงาน)")
+        self.status.set("โหลดภาพ Test แล้ว — กด ▶ ตรวจสอบ")
+
+    def test_from_pdf(self, path=None):
         """เลือก PDF -> หามาร์ค + zoom + mirror + หมุน ให้ตรงกับ Master -> ใช้เป็นภาพ Test"""
         from tkinter import filedialog, messagebox
         if self.master_img is None:
             messagebox.showwarning(mark_ui.APP, "เลือก Master ก่อน (ภาพมาร์คที่อ่านได้ปกติ)\n"
                                    "โปรแกรมใช้ Master เป็นแบบในการหามาร์คใน PDF")
             return
-        p = filedialog.askopenfilename(title="เลือก PDF (Order screen) สำหรับ Test",
-                                       filetypes=[("PDF", "*.pdf")])
+        p = path or filedialog.askopenfilename(title="เลือก PDF (Order screen) สำหรับ Test",
+                                               filetypes=[("PDF", "*.pdf")])
         if not p:
             return
-        self.status.set("กำลังหามาร์คใน PDF (zoom / mirror / หมุน อัตโนมัติ) … บน Pi อาจใช้ 10-30 วินาที")
+        self.status.set("กำลังหามาร์คใน PDF (zoom / mirror / หมุน อัตโนมัติ) … บน Pi อาจใช้ 1-2 นาที")
         self.update_idletasks()
         try:
             from pdf_autofind import find_mark_in_pdf
@@ -186,16 +267,9 @@ class AppPlus(mark_ui.App):
             messagebox.showerror(mark_ui.APP, f"หามาร์คใน PDF ไม่สำเร็จ:\n{ex}")
             self.status.set("หามาร์คใน PDF ไม่สำเร็จ")
             return
-        if getattr(self, "live", False) and hasattr(self, "toggle_camera"):
-            self.toggle_camera()
-        self.test_img = r["test"]
-        self.test_path.set(p)
-        pn = self.__dict__.get("pn_test")
-        if pn is not None and hasattr(pn, "title_var"):
-            pn.title_var.set("Test (จาก PDF — ปรับทิศแล้ว)")
-            pn.set(self.test_img)
+        self._show_test(r["test"], p, "Test (จาก PDF — ปรับทิศแล้ว)")
         self.status.set(f"พบมาร์คใน PDF: กลับด้าน={'ใช่' if r['mirrored'] else 'ไม่'}  หมุน {r['angle']}°  "
-                        f"จุดอ้างอิง {r['inliers']}  — กด ▶ ตรวจสอบ")
+                        f"จุดอ้างอิง {r['inliers']} ({r.get('quality', '')})  — กด ▶ ตรวจสอบ")
 
     # ---------------------------------------------------------- ตรวจ
     def run_inspect(self, frame=None):
@@ -216,6 +290,10 @@ class AppPlus(mark_ui.App):
 
     def _on_result(self, res):
         super()._on_result(res)
+        try:
+            self._show_verdict(self.report.get("verdict", ""))
+        except Exception:
+            pass
         extra = [self._pol_msg] if self._pol_msg else []
         if self.auto_save is not None and self.auto_save.get():
             try:
@@ -225,6 +303,10 @@ class AppPlus(mark_ui.App):
                 extra.append(f"บันทึกผลไม่สำเร็จ: {ex}")
         if extra:
             self.status.set(self.status.get() + "   |   " + "   |   ".join(extra))
+
+    def _on_error(self, ex):
+        super()._on_error(ex)
+        self._show_verdict("ERR")
 
     # ---------------------------------------------------------- บันทึก
     def _save_result(self):
