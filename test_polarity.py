@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-test_polarity.py v2 — ส่วนเสริมสำหรับมาร์คบน "สกรีนสี" (ตัวหนังสือขาว/เหลืองบนกระจกเขียว)
-ไม่แก้ไขโค้ดเดิม: แปลงภาพเป็น "ตัวดำบนพื้นขาว" ก่อนส่งเข้าการตรวจเดิม
-  - แปลงทั้ง Master และ Test / ตัดเฉพาะแผ่นสกรีนสีในภาพ Test / ขยาย Test ให้ใกล้ขนาด Master
-  - ภาพตัวดำพื้นขาวแบบเดิม ไม่ถูกแตะ
+test_polarity.py v3 — ส่วนเสริมสำหรับมาร์คบน "สกรีนสี" (กระจกเขียว ฯลฯ)
+ไม่แก้ไขโค้ดเดิม: แปลงภาพเป็น "ตัวดำบนพื้นขาว สีเทาล้วน" ก่อนส่งเข้าการตรวจเดิม
+
+v3:
+  1) ตัวหนังสือ "สีเข้ม" บนพื้นเขียว ก็ต้องแปลงด้วย
+     (เดิมแปลงเฉพาะตัวสีอ่อน -> พื้นเขียวถูกโปรแกรมเดิมเข้าใจว่าเป็น "รอยปากกาสี" 77% ของภาพ
+      แล้วลบทิ้ง + ขยายขอบ -> กินขอบตัวอักษร -> ขึ้นสีส้ม (จางขาดหาย) เต็มภาพ)
+  2) ทำขอบคม: ตัดพื้นหลัง/noise ให้ขาวสนิท (ไม่มีแถบเทา/เส้นลายจอ) + unsharp mask
+  3) ภาพตัวดำพื้นขาว ไม่มีสี (แบบเดิม) -> ไม่แตะเลย
 """
 import numpy as np
 import cv2
@@ -67,32 +72,87 @@ def detect_light_marks(bgr):
 
 
 def is_color_screen(bgr, sat_thr=45, min_frac=0.35):
+    if bgr is None:
+        return False
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     return float(((hsv[:, :, 1] > sat_thr) & (hsv[:, :, 2] > 40)).mean()) >= min_frac
 
 
-def normalize_test(bgr, mode="อัตโนมัติ"):
+def _crisp(d, sharpen=True):
+    """
+    d = ค่าความเข้มของหมึก (บวก = หมึก) -> ภาพตัวดำพื้นขาว ขอบคม
+      - ต่ำกว่าระดับ noise พื้นหลัง -> ขาวสนิท (ตัดแถบเทา/ลายจอ)
+      - สูงกว่าระดับหมึกเต็ม -> ดำสนิท
+      - ช่วงกลางยืดแบบชัน -> ขอบคม
+    """
+    d = cv2.bilateralFilter(d.astype(np.float32), 5, 12, 5)          # ลด noise แต่คงขอบ
+    pos = d[d > 0]
+    if pos.size < 50:
+        pos = np.abs(d).ravel()
+    noise = float(np.percentile(np.abs(d), 60))                     # ระดับพื้นหลัง
+    full = max(float(np.percentile(pos, 97)), noise + 8.0)          # ระดับหมึกเต็ม
+    lo = noise + 0.15 * (full - noise)
+    hi = noise + 0.70 * (full - noise)
+    ink = np.clip((d - lo) / max(hi - lo, 1.0), 0, 1)
+    out = (255 * (1 - ink)).astype(np.uint8)
+    if sharpen:
+        blur = cv2.GaussianBlur(out, (0, 0), 1.2)
+        out = cv2.addWeighted(out, 1.6, blur, -0.6, 0)
+    return out
+
+
+def normalize_test(bgr, mode="อัตโนมัติ", force=False):
+    """
+    คืน (ภาพตัวดำพื้นขาว สีเทาล้วน, ข้อความ)
+    แปลงเมื่อ: ตัวหนังสือสีอ่อน  หรือ  ภาพเป็นสกรีนสี (force/ตรวจพบ)  หรือ  โหมดบังคับ
+    ภาพตัวเข้ม พื้นขาว ไม่มีสี ในโหมดอัตโนมัติ -> คืนภาพเดิม
+    """
     if bgr is None or mode == MODES[1]:
         return bgr, ""
     light, name, _ = detect_light_marks(bgr)
-    if mode == MODES[0] and not light:
+    colored = force or is_color_screen(bgr, min_frac=0.25)
+    if mode == MODES[0] and not light and not colored:
         return bgr, ""
     d = _flatten(cv2.GaussianBlur(dict(_channels(bgr))[name], (3, 3), 0))
     if not light:
         d = -d
-    top = max(float(np.percentile(d, 99.5)), 8.0)
-    out = (255 * (1 - np.clip(d / top, 0, 1))).astype(np.uint8)
-    out = cv2.createCLAHE(2.0, (8, 8)).apply(out)
-    return cv2.cvtColor(out, cv2.COLOR_GRAY2BGR), f"กลับสี (ช่อง {name})"
+    out = _crisp(d)
+    kind = "ตัวอ่อน" if light else "ตัวเข้ม"
+    return cv2.cvtColor(out, cv2.COLOR_GRAY2BGR), f"แปลง{kind}บนพื้นสี -> ขาวดำ (ช่อง {name})"
 
 
-def clean_master(bgr, min_frac=0.00015):
-    g = cv2.GaussianBlur(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), (3, 3), 0)
-    _, ink = cv2.threshold(g, 0, 1, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    n, lab, st, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), 8)
+def clean_master(bgr, min_area=12):
+    """Master ที่แปลงแล้ว -> ขาวดำ + ลบจุดเล็กมาก (ฝุ่น/ลายจอ) โดยไม่ตัดขีด/วงเล็บเล็ก ๆ"""
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    ink = (g < 140).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(ink, 8)
     keep = np.zeros(n, bool)
-    keep[1:] = st[1:, cv2.CC_STAT_AREA] >= max(30, int(min_frac * g.size))
+    keep[1:] = st[1:, cv2.CC_STAT_AREA] >= min_area
     return cv2.cvtColor(np.where(keep[lab], 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+
+def _normalize_master(master, mode, m_col):
+    """
+    Master ที่เป็นรูปถ่ายสกรีนสี: แปลงเฉพาะ "แผ่นสกรีน" (ไม่เอาพื้นเทา/ตัวหนังสือกลับด้านด้านหลังมาคิด)
+    แล้ววางกลับในภาพขาวขนาดเดิม -> พิกัดเท่าเดิม โซน IGNORE ที่ลากไว้ยังใช้ได้
+    """
+    if master is None:
+        return master, ""
+    if m_col:
+        crop, box = crop_color_patch(master, max_frac=0.95)
+        if box is not None:
+            # ภาพเล็ก -> ขยายก่อนแปลง (เส้นบางไม่ขาด) แล้วย่อกลับขนาดเดิม
+            up = max(1.0, min(4.0, 900.0 / max(1, crop.shape[1])))
+            big = cv2.resize(crop, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC) if up > 1 else crop
+            c2, msg = normalize_test(big, mode, force=True)
+            if msg and up > 1:
+                c2 = cv2.resize(c2, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_AREA)
+            if msg:
+                x, y, w, h = box
+                out = np.full_like(master, 255)
+                out[y:y + h, x:x + w] = c2
+                return out, msg + " (เฉพาะแผ่นสกรีน)"
+    return normalize_test(master, mode, force=m_col)
 
 
 def prepare_pair(master, test, mode="อัตโนมัติ"):
@@ -101,11 +161,9 @@ def prepare_pair(master, test, mode="อัตโนมัติ"):
         return master, test, ""
     msgs = []
     t = test
-    need_crop = test is not None and (
-        mode == MODES[2]
-        or (master is not None and is_color_screen(master, min_frac=0.25))
-        or is_color_screen(test, min_frac=0.04))
-    if need_crop:
+    m_col = is_color_screen(master, min_frac=0.08)
+    t_col = test is not None and is_color_screen(test, min_frac=0.04)
+    if test is not None and (mode == MODES[2] or m_col or t_col):
         t2, box = crop_color_patch(test)
         if box is not None:
             t = t2
@@ -113,8 +171,8 @@ def prepare_pair(master, test, mode="อัตโนมัติ"):
     if t is not None and master is not None and t.shape[1] < 0.8 * master.shape[1]:
         s = min(4.0, master.shape[1] / float(t.shape[1]))
         t = cv2.resize(t, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
-    m2, mm = normalize_test(master, mode)
-    t3, tm = normalize_test(t, mode)
+    m2, mm = _normalize_master(master, mode, m_col)
+    t3, tm = normalize_test(t, mode, force=t_col or m_col)
     if mm:
         m2 = clean_master(m2)
         msgs.append("Master " + mm)
