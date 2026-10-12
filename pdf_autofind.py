@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pdf_autofind.py — หา "มาร์ค" ในไฟล์ PDF แบบงานจริง (Order screen) อัตโนมัติ
+pdf_autofind.py v2 — หา "มาร์ค" ในไฟล์ PDF (Order screen / APP Film) อัตโนมัติ
 แล้ว zoom + กลับด้าน (mirror) + หมุน ให้ตรงกับภาพ Master
 
-เหตุผล: PDF ของสกรีนเป็นภาพจากด้านพิมพ์ -> มาร์ค "กลับด้าน" และ "เอียง" ตามรูปกระจก
-         ส่วน Master เป็นภาพมาร์คตรง อ่านได้ปกติ
-
-วิธีทำ (อัตโนมัติทั้งหมด):
-  1) render หน้า PDF ความละเอียดสูง
-  2) หาจุดเด่น (SIFT) ทั้งใน Master และ PDF — ลองทั้ง "ปกติ" และ "กลับด้าน"
-  3) จับคู่ + RANSAC -> ได้ตำแหน่ง มุมหมุน ขนาด ของมาร์คใน PDF
-  4) เลือกแบบที่จับคู่ได้มากที่สุด (บอกได้ว่ากลับด้านหรือไม่ หมุนกี่องศา)
-  5) บิดภาพ PDF ให้ซ้อนทับ Master พอดี -> ได้ภาพ Test ขนาด/ทิศเดียวกับ Master
-
-ใช้เดี่ยว ๆ:
-  python pdf_autofind.py "Order screen C857.pdf" "C857 master mark.png" --out test_from_pdf.png
+v2:
+  - หามาร์ค "ตัวเล็กมาก" บนหน้าใหญ่ได้ (เช่น APP Film T1, Order screen J0)
+      เดิม: render ทั้งหน้าความละเอียดเดียว -> มาร์คเหลือไม่กี่สิบพิกเซล -> หาไม่เจอ
+      ใหม่: หา "กลุ่มตัวหนังสือ" (จุดที่มีตัวอักษรเล็ก ๆ อยู่รวมกัน) ทั่วหน้า
+            แล้ว render เฉพาะแต่ละกลุ่มความละเอียดสูง และจับคู่กับ Master ทีละกลุ่ม
+  - หน้าที่มีมาร์คหลายตำแหน่ง (เช่น ซ้าย/ขวา) -> เลือกตำแหน่งที่ตรงกับ Master มากที่สุด
+  - แก้ error "division by zero"
+  - เร็วขึ้น/ใช้หน่วยความจำน้อยลง: ค้นทีละกลุ่ม หยุดเมื่อเจอตำแหน่งที่ตรงชัดเจน
+  - บอกสาเหตุชัดเจนเมื่อหาไม่เจอ (เช่น Master คนละโมเดลกับ PDF)
 """
 import argparse
 import math
@@ -29,12 +26,15 @@ except Exception:
     import fitz
 
 
+# ---------------------------------------------------------------- render
 def render_pdf(path, page_no=0, long_side=3000, clip=None):
-    """render หน้า PDF (หรือเฉพาะบริเวณ clip ในหน่วย pt) — คืน (ภาพ, scale px/pt, จุดเริ่ม clip)"""
+    """คืน (ภาพ BGR, scale px/pt, (x0,y0) ของ clip เป็น pt)"""
     doc = fitz.open(path)
     try:
         page = doc[page_no]
         r = page.rect if clip is None else (fitz.Rect(clip) & page.rect)
+        if r.is_empty or r.width < 1 or r.height < 1:
+            raise ValueError("บริเวณที่ตัดว่างเปล่า")
         s = long_side / max(r.width, r.height)
         pix = page.get_pixmap(matrix=fitz.Matrix(s, s), clip=r, alpha=False)
         img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n).copy()
@@ -44,14 +44,33 @@ def render_pdf(path, page_no=0, long_side=3000, clip=None):
         doc.close()
 
 
+def page_size(path, page_no=0):
+    doc = fitz.open(path)
+    try:
+        r = doc[page_no].rect
+        return r.width, r.height
+    finally:
+        doc.close()
+
+
+# ---------------------------------------------------------------- matching
 def _gray(img):
     return img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+
+def _clean_master(master_bgr):
+    """ลบเส้นประ/กรอบสีแดงใน Master (ถ้ามี) ก่อนใช้หาจุดเด่น"""
+    b, g, r = [c.astype(np.int16) for c in cv2.split(master_bgr)]
+    red = (r - np.maximum(g, b)) > 40
+    out = master_bgr.copy()
+    out[cv2.dilate(red.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0] = (255, 255, 255)
+    return out
 
 
 def _detector():
     try:
         return cv2.SIFT_create(nfeatures=8000), cv2.NORM_L2
-    except Exception:                         # OpenCV รุ่นเก่ามากไม่มี SIFT
+    except Exception:
         return cv2.ORB_create(8000), cv2.NORM_HAMMING
 
 
@@ -66,24 +85,24 @@ def _match(master_g, page_g, det, norm, ratio=0.75):
         return None, 0
     src = np.float32([km[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     dst = np.float32([kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-    # similarity (หมุน + ย่อขยาย + เลื่อน) — เหมาะกับงานพิมพ์ ไม่บิดเบี้ยว
     A, inl = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=4.0,
                                          maxIters=5000, confidence=0.999)
-    if A is None:
+    if A is None or inl is None:
+        return None, 0
+    if math.hypot(A[0, 0], A[1, 0]) < 1e-3:          # ขนาดเป็นศูนย์ = จับคู่ผิด
         return None, 0
     return A, int(inl.sum())
 
 
 def find_mark(page_bgr, master_bgr, min_inliers=12):
     """
-    คืน dict(test=ภาพที่ตรงกับ Master, mirrored, angle, scale, inliers, box=4 มุมในหน้า PDF)
-    หรือ None ถ้าหาไม่เจอ
+    คืน dict(test, mirrored, angle, scale, inliers, box) หรือ None
+    test = ภาพจาก page ที่บิดให้ซ้อนทับ Master พอดี (ขนาดเท่า Master)
     """
     det, norm = _detector()
     mh, mw = master_bgr.shape[:2]
-    # ย่อหน้า PDF ให้มาร์คมีขนาดใกล้ Master คร่าว ๆ ก่อน (เร็วขึ้น) แล้วคำนวณกลับ
     pg = _gray(page_bgr)
-    mg = _gray(master_bgr)
+    mg = _gray(_clean_master(master_bgr))
     best = None
     for mirrored in (False, True):
         mg2 = cv2.flip(mg, 1) if mirrored else mg
@@ -93,46 +112,112 @@ def find_mark(page_bgr, master_bgr, min_inliers=12):
     if best is None or best[2] < min_inliers:
         return None
     mirrored, A, n = best
-    # A: master(ที่อาจถูก flip) -> page   =>   รวม flip เข้าไป: master -> page
     F = np.array([[-1, 0, mw - 1], [0, 1, 0], [0, 0, 1]], np.float64) if mirrored else np.eye(3)
     M = np.vstack([A, [0, 0, 1]]) @ F
     Minv = np.linalg.inv(M)
-    test = cv2.warpAffine(page_bgr, Minv[:2], (mw, mh), flags=cv2.INTER_AREA,
-                          borderValue=(255, 255, 255))
-    scale = math.hypot(A[0, 0], A[1, 0])
-    angle = math.degrees(math.atan2(A[1, 0], A[0, 0]))
+    test = cv2.warpAffine(page_bgr, Minv[:2], (mw, mh), flags=cv2.INTER_AREA, borderValue=(255, 255, 255))
     corners = cv2.transform(np.float32([[0, 0], [mw, 0], [mw, mh], [0, mh]]).reshape(-1, 1, 2), M[:2])
-    return dict(test=test, mirrored=mirrored, angle=round(angle, 1), scale=round(scale, 3),
-                inliers=n, box=corners.reshape(-1, 2))
+    return dict(test=test, mirrored=mirrored, angle=round(math.degrees(math.atan2(A[1, 0], A[0, 0])), 1),
+                scale=round(math.hypot(A[0, 0], A[1, 0]), 3), inliers=n, box=corners.reshape(-1, 2))
 
 
+# ---------------------------------------------------------------- หา "กลุ่มตัวหนังสือ" บนหน้า
+def text_candidates(page_bgr, max_cand=12):
+    """
+    หาบริเวณที่มี "ตัวอักษรเล็ก ๆ หลายตัวอยู่รวมกัน" (= มาร์ค) บนหน้า PDF
+    ตัดของใหญ่ (แผ่นสีดำกระจก, ตาราง, เส้นยาว) และจุดเดี่ยว (dot pattern) ออก
+    คืน list ของ (x, y, w, h) หน่วยพิกเซลของภาพ page_bgr  เรียงจากน่าจะใช่มากสุด
+    """
+    g = _gray(page_bgr)
+    H, W = g.shape
+    ink = (g < 150).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(ink, 8)
+    small = np.zeros(n, bool)
+    a = st[:, cv2.CC_STAT_AREA]
+    w_, h_ = st[:, 2], st[:, 3]
+    big = max(W, H) * 0.02                         # ตัวอักษรต้องเล็กกว่า 2% ของหน้า
+    small[1:] = (a[1:] >= 4) & (w_[1:] < big) & (h_[1:] < big)
+    # จุดเดี่ยว ๆ ทรงกลมขนาดเท่ากันจำนวนมาก (dot pattern ขอบกระจก) -> ไม่นับ
+    sizes = np.maximum(w_, h_)
+    dotlike = (np.abs(w_ - h_) <= 1) & (a >= 0.6 * w_ * h_)
+    small &= ~dotlike
+    mask = np.where(small[lab], 255, 0).astype(np.uint8)
+    k = max(5, int(max(W, H) * 0.006)) | 1
+    blob = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    m2, lab2, st2, _ = cv2.connectedComponentsWithStats(blob, 8)
+    cands = []
+    for i in range(1, m2):
+        x, y, w, h, area = st2[i]
+        if w < 10 or h < 10 or max(w, h) > max(W, H) * 0.25:
+            continue
+        cnt = len(np.unique(lab[(lab2 == i) & (mask > 0)]))  # จำนวนตัวอักษรในกลุ่ม
+        if cnt < 8:
+            continue
+        cands.append((cnt, (int(x), int(y), int(w), int(h))))
+    cands.sort(key=lambda c: -c[0])
+    return [b for _, b in cands[:max_cand]]
+
+
+# ---------------------------------------------------------------- หลัก
 def find_mark_in_pdf(pdf_path, master_bgr, page_no=0):
     """
-    2 รอบ (ประหยัดหน่วยความจำ — ใช้ได้บน Raspberry Pi):
-      รอบหยาบ: render ทั้งหน้าความละเอียดปานกลาง -> หาตำแหน่งมาร์คคร่าว ๆ
-      รอบละเอียด: render เฉพาะบริเวณมาร์คให้มาร์คใหญ่กว่า Master ~2 เท่า -> หาใหม่ให้แม่น
+    1) ลองแบบเร็ว: ทั้งหน้า (ใช้ได้เมื่อมาร์คใหญ่พอ)
+    2) ไม่เจอ: หากลุ่มตัวหนังสือทั่วหน้า -> render แต่ละกลุ่มละเอียด -> จับคู่ -> เลือกกลุ่มที่ดีที่สุด
+    3) จูนละเอียดรอบสุดท้ายรอบตำแหน่งที่เจอ
     """
     mh, mw = master_bgr.shape[:2]
-    coarse = None
-    for long_side in (2500, 4000, 6000):
-        page, s, _ = render_pdf(pdf_path, page_no, long_side)
-        coarse = find_mark(page, master_bgr)
+    best = None          # (result, scale, offset)
+    GOOD = 60            # จุดอ้างอิงพอแล้ว -> หยุดค้นต่อ (ประหยัดเวลาบน Pi)
+
+    # --- 1) กลุ่มตัวหนังสือทั่วหน้า (render ละเอียดพอเห็นตัวอักษร)
+    page, s, off = render_pdf(pdf_path, page_no, 7000)
+    cands = text_candidates(page, max_cand=8)
+    del page
+    for (x, y, w, h) in cands:
+        pad = 0.6 * max(w, h)
+        clip = (off[0] + (x - pad) / s, off[1] + (y - pad) / s,
+                off[0] + (x + w + pad) / s, off[1] + (y + h + pad) / s)
+        try:
+            reg, s2, off2 = render_pdf(pdf_path, page_no, 2000, clip)
+        except ValueError:
+            continue
+        rr = find_mark(reg, master_bgr)
+        if rr is not None and (best is None or rr["inliers"] > best[0]["inliers"]):
+            best = (rr, s2, off2)
+            if rr["inliers"] >= GOOD * 2:
+                break
+
+    # --- 2) สำรอง: ทั้งหน้า (มาร์คใหญ่ / ไม่มีกลุ่มตัวหนังสือชัด)
+    if best is None or best[0]["inliers"] < GOOD:
+        page, s, off = render_pdf(pdf_path, page_no, 3000)
+        r = find_mark(page, master_bgr)
         del page
-        if coarse is not None:
-            break
-    if coarse is None:
-        raise RuntimeError("หามาร์คใน PDF ไม่เจอ — เช็คว่า Master เป็นรุ่นเดียวกับ PDF")
-    box_pt = coarse["box"] / s
+        if r is not None and (best is None or r["inliers"] > best[0]["inliers"]):
+            best = (r, s, off)
+
+    if best is None:
+        raise RuntimeError(
+            "หามาร์คใน PDF ไม่เจอ\n"
+            "- เช็คว่า Master เป็น 'โมเดลเดียวกับ PDF' (เลข 43R-…, รหัสรุ่น เช่น J0/T1 ต้องตรงกัน)\n"
+            "- PDF บางแบบมีมาร์คไม่ครบ (เช่น มีแค่โลโก้ + 1 2 4 8) จะเทียบกับ Master เต็มไม่ได้")
+
+    # --- 3) จูนละเอียด: render รอบตำแหน่งที่เจอ ให้มาร์คใหญ่ ~2 เท่าของ Master
+    r, s, off = best
+    box_pt = r["box"] / s + np.array(off)
     x0, y0 = box_pt.min(axis=0)
     x1, y1 = box_pt.max(axis=0)
-    pad = 0.15 * max(x1 - x0, y1 - y0)
+    span = max(x1 - x0, y1 - y0, 1.0)
+    pad = 0.15 * span
     clip = (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
-    # ให้มาร์คในภาพละเอียดยาวราว 2 เท่าของ Master (คมชัด แต่ไม่ใหญ่เกิน)
-    side = 2.0 * max(mw, mh) * (max(x1 - x0, y1 - y0) + 2 * pad) / max(x1 - x0, y1 - y0)
-    region, s2, _ = render_pdf(pdf_path, page_no, int(min(6000, max(800, side))), clip)
-    fine = find_mark(region, master_bgr)
-    r = fine if fine is not None and fine["inliers"] >= coarse["inliers"] * 0.5 else coarse
-    r["coarse_inliers"] = coarse["inliers"]
+    try:
+        reg, s3, off3 = render_pdf(pdf_path, page_no, int(min(6000, max(800, 2.0 * max(mw, mh) * 1.3))), clip)
+        fine = find_mark(reg, master_bgr)
+        if fine is not None and fine["inliers"] >= r["inliers"] * 0.5:
+            r = fine
+    except ValueError:
+        pass
+    r["coarse_inliers"] = best[0]["inliers"]
+    r["quality"] = "ดี" if r["inliers"] >= 60 else ("พอใช้" if r["inliers"] >= 25 else "ต่ำ — ควรเช็คว่าโมเดลตรงกัน")
     return r
 
 
@@ -145,7 +230,7 @@ def main():
     r = find_mark_in_pdf(a.pdf, master)
     cv2.imencode(".png", r["test"])[1].tofile(a.out)
     print(f"OK  mirror={r['mirrored']}  angle={r['angle']}°  scale={r['scale']}  "
-          f"inliers={r['inliers']} (coarse {r['coarse_inliers']})  -> {a.out}")
+          f"inliers={r['inliers']}  quality={r['quality']}  -> {a.out}")
 
 
 if __name__ == "__main__":
