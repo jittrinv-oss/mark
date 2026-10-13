@@ -1,46 +1,200 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mark_ui_kiosk.py — เปิดโปรแกรมตรวจมาร์ค (mark_ui_plus) แบบ "เต็มจอทันที"
-ไม่แก้ไขไฟล์เดิม: แค่สร้างหน้าต่างจาก AppPlus แล้วขยายเต็มจอให้อัตโนมัติ
-  F11  = สลับ เต็มจอ (ไม่มีแถบหัว) / ขยายเต็มหน้าต่าง
-  Esc  = ออกจากโหมดเต็มจอ (กลับเป็นหน้าต่างขยายเต็ม)
-ใช้กับ autostart บน Pi:  bash run_kiosk.sh
+mark_ui_kiosk.py v3 — เปิดโปรแกรมตรวจมาร์ค (mark_ui_plus) แบบเต็มจอ + จัดภาพก่อนตรวจ (prealign)
+ไม่แก้ไขไฟล์เดิม
+
+v2: ด่านก่อนตรวจ (prealign.py) — จัดภาพ Test ให้ตรง Master, จับคู่ไม่ได้ -> "ถ่ายใหม่"
+v3: ตัวหนังสือภาษาไทยใหญ่และชัดขึ้น
+    - เลือกฟอนต์ไทยที่มีในเครื่องเอง (Pi: Noto Sans Thai / Loma / Garuda, Windows: Leelawadee UI / Tahoma)
+    - ขยายตัวหนังสือทุกปุ่ม/ป้าย/ช่อง (ตั้งค่าได้ที่ FONT_SIZE ด้านล่าง)
+    - ระยะขอบรอบตัวหนังสือในปุ่ม ~0.1 ซม. (4 px) -> ปุ่มไม่บวมแม้ตัวหนังสือใหญ่ขึ้น
+    - ช่องภาพด้านล่างเล็กลงอัตโนมัติตามพื้นที่ที่แถบด้านบนใช้เพิ่ม
+
+  F11 = สลับเต็มจอ / Esc = ออกจากเต็มจอ
+  ไม่ใช้ด่านก่อนตรวจ:  python mark_ui_kiosk.py --no-prealign
 """
 import sys
+import tkinter as tk
+from tkinter import ttk
+from tkinter import font as tkfont
 
 try:
-    from mark_ui_plus import AppPlus as App
-except Exception:                      # ถ้าไม่มีไฟล์ plus ใช้โปรแกรมเดิม
-    from mark_ui import App
+    from mark_ui_plus import AppPlus as Base
+except Exception:
+    from mark_ui import App as Base
 
-FULLSCREEN = "--fullscreen" in sys.argv     # ไม่ใส่ = ขยายเต็มจอแบบยังมีแถบหัวหน้าต่าง
+try:
+    from prealign import prealign
+except Exception:
+    prealign = None
+
+FULLSCREEN = "--fullscreen" in sys.argv
+USE_PREALIGN = "--no-prealign" not in sys.argv and prealign is not None
+ORANGE = "#ef8a00"
+
+# ---------------- ปรับขนาดตัวหนังสือได้ที่นี่ ----------------
+FONT_SIZE = 12          # ตัวหนังสือทั่วไป / ปุ่ม  (เดิม 8-9)
+FONT_SIZE_RUN = 15      # ปุ่ม ▶ ตรวจสอบ
+FONT_SIZE_TAB = 12      # แท็บ
+PAD = 4                 # ระยะขอบรอบตัวหนังสือ (px) ~0.1 ซม.
+KEEP_BIG = 18           # ตัวหนังสือที่ใหญ่อยู่แล้ว (เช่น ป้าย OK/NG) ไม่ย่อ/ไม่แตะขนาด
+
+THAI_FONTS = ("Noto Sans Thai", "Noto Sans Thai UI", "Sarabun", "Loma", "Garuda",
+              "Leelawadee UI", "Leelawadee", "Tahoma", "Norasi", "Kinnari")
+
+
+def pick_thai_font(root):
+    have = set(tkfont.families(root))
+    for f in THAI_FONTS:
+        if f in have:
+            return f
+    return None
+
+
+class KioskApp(Base):
+    def __init__(self):
+        self._pre_msgs = []
+        self._orig_test = None
+        super().__init__()
+        try:
+            self._bigger_ui()
+        except Exception as ex:                       # ปรับหน้าตาไม่สำเร็จ ไม่ให้โปรแกรมพัง
+            print("bigger_ui:", ex)
+
+    # ------------------------------------------------------------ หน้าตา v3
+    def _bigger_ui(self):
+        fam = pick_thai_font(self)
+        self._thai_font = fam
+        if fam is None:
+            fam = tkfont.nametofont("TkDefaultFont").actual("family")
+            print("ไม่พบฟอนต์ไทย — ติดตั้งบน Pi: sudo apt install fonts-thai-tlwg fonts-noto-core")
+        F = lambda s, w="normal": (fam, s, w)
+
+        # ฟอนต์ตั้งต้นของ Tk (หน้าต่างเลือกไฟล์ / ข้อความแจ้งเตือน / รายการใน Combobox)
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont"):
+            try:
+                tkfont.nametofont(name).configure(family=fam, size=FONT_SIZE)
+            except Exception:
+                pass
+        self.option_add("*TCombobox*Listbox.font", F(FONT_SIZE))
+
+        st = ttk.Style(self)
+        st.configure(".", font=F(FONT_SIZE))
+        st.configure("TButton", font=F(FONT_SIZE, "bold"), padding=(PAD, PAD))
+        st.configure("Run.TButton", font=F(FONT_SIZE_RUN, "bold"), padding=(PAD * 2, PAD))
+        st.configure("TCheckbutton", font=F(FONT_SIZE))
+        st.configure("TRadiobutton", font=F(FONT_SIZE))
+        st.configure("TCombobox", padding=(PAD, 1))
+        st.configure("TEntry", padding=(PAD, 1))
+        st.configure("TNotebook.Tab", font=F(FONT_SIZE_TAB, "bold"), padding=(PAD * 2, PAD))
+        st.configure("Treeview", font=F(FONT_SIZE - 1), rowheight=int((FONT_SIZE + 10) * 1.4))
+        st.configure("Treeview.Heading", font=F(FONT_SIZE - 1, "bold"))
+
+        self._restyle(self, fam)
+
+    def _restyle(self, w, fam):
+        """ไล่ทุกปุ่ม/ป้าย/ช่อง: ใช้ฟอนต์ไทย, ขยายขนาด, ลดระยะขอบ"""
+        for c in w.winfo_children():
+            cls = c.winfo_class()
+            if cls in ("Label", "Entry", "Text", "TEntry", "TCombobox", "Spinbox", "TSpinbox"):
+                try:
+                    act = tkfont.Font(font=c.cget("font")).actual()
+                    size = abs(int(act.get("size", 9))) or 9
+                    if size < KEEP_BIG:
+                        size = FONT_SIZE
+                    c.configure(font=(fam, size, act.get("weight", "normal")))
+                except Exception:
+                    pass
+            if cls in ("TButton", "TCheckbutton", "TRadiobutton", "TCombobox", "TEntry", "Label", "Entry"):
+                for mgr in ("pack", "grid"):
+                    try:
+                        if c.winfo_manager() == mgr:
+                            info = getattr(c, mgr + "_info")()
+                            if "ipady" in info and int(str(info["ipady"]).split()[0]) > 4:
+                                continue                      # ป้าย OK/NG ใหญ่ — ไม่แตะ
+                            getattr(c, mgr + "_configure")(padx=2, pady=1)
+                    except Exception:
+                        pass
+            if cls == "Label":
+                try:
+                    if tkfont.Font(font=c.cget("font")).actual().get("size", 9) < KEEP_BIG:
+                        c.configure(padx=PAD, pady=1)
+                except Exception:
+                    pass
+            self._restyle(c, fam)
+
+    # ------------------------------------------------------------ ด่านก่อนตรวจ (v2)
+    def _big(self, text, color):
+        lbl = self.__dict__.get("big_verdict")
+        if lbl is not None:
+            try:
+                lbl.config(text=text, bg=color)
+            except Exception:
+                pass
+        pn = self.__dict__.get("pn_result")
+        if pn is not None:
+            try:
+                pn.config(highlightbackground=color, highlightcolor=color, highlightthickness=8)
+            except Exception:
+                pass
+
+    def run_inspect(self, frame=None):
+        test = frame if frame is not None else self.test_img
+        self._pre_msgs = []
+        if not USE_PREALIGN or self.busy or test is None or self.master_img is None:
+            return super().run_inspect(frame)
+        try:
+            r = prealign(self.master_img, test)
+        except Exception as ex:
+            self._pre_msgs = [f"จัดภาพล่วงหน้าไม่สำเร็จ ({ex}) — ใช้วิธีเดิม"]
+            return super().run_inspect(frame)
+        if not r["ok"]:
+            self._big("ถ่ายใหม่", ORANGE)
+            self.status.set("⚠ " + " / ".join(r["problems"]) + f"   (จุดอ้างอิง {r['inliers']})")
+            return None
+        self._orig_test = test.copy()
+        self._pre_msgs = [f"จัดภาพแล้ว: {'กลับด้าน ' if r['mirrored'] else ''}หมุน {r['angle']}°, "
+                          f"จุดอ้างอิง {r['inliers']}"] + ["⚠ " + p for p in r["problems"]]
+        out = super().run_inspect(r["test"])
+        if self.__dict__.get("_raw_test") is not None:
+            self._raw_test = self._orig_test
+        return out
+
+    def _on_result(self, res):
+        super()._on_result(res)
+        msgs = list(self._pre_msgs)
+        try:
+            els = [e for e in self.report.get("elements", []) if e.get("status") != "SKIP"]
+            bad = [e for e in els if e.get("status") in ("MISSING", "PARTIAL")]
+            if els and len(bad) / len(els) > 0.30:
+                msgs.append(f"⚠ NG {len(bad)}/{len(els)} ชิ้น — อาจเป็นคนละโมเดล หรือภาพไม่ชัด ตรวจ Master ก่อน")
+        except Exception:
+            pass
+        if msgs:
+            self.status.set(self.status.get() + "   |   " + "   |   ".join(msgs))
 
 
 def maximize(app):
     app.update_idletasks()
-    w, h = app.winfo_screenwidth(), app.winfo_screenheight()
     try:
         app.minsize(1, 1)
     except Exception:
         pass
-    done = False
-    for how in (lambda: app.attributes("-zoomed", True),   # Linux / Pi
-                lambda: app.state("zoomed")):               # Windows
+    for how in (lambda: app.attributes("-zoomed", True), lambda: app.state("zoomed")):
         try:
             how()
-            done = True
             break
         except Exception:
             pass
-    if not done:
-        app.geometry(f"{w}x{h}+0+0")
+    else:
+        app.geometry(f"{app.winfo_screenwidth()}x{app.winfo_screenheight()}+0+0")
     if FULLSCREEN:
         app.attributes("-fullscreen", True)
 
 
 def main():
-    app = App()
+    app = KioskApp()
     state = {"fs": FULLSCREEN}
 
     def toggle(_e=None):
@@ -53,9 +207,13 @@ def main():
 
     app.bind("<F11>", toggle)
     app.bind("<Escape>", leave)
-    # รอให้หน้าจอ/ตัวจัดหน้าต่างพร้อมก่อน แล้วค่อยขยาย (ตอนบูตใหม่ ๆ สั่งเร็วไปจะไม่มีผล)
     app.after(300, lambda: maximize(app))
     app.after(2500, lambda: maximize(app))
+    if getattr(app, "_thai_font", None) is None:
+        try:
+            app.status.set("⚠ ไม่พบฟอนต์ไทย — บน Pi พิมพ์: sudo apt install fonts-thai-tlwg fonts-noto-core")
+        except Exception:
+            pass
     app.mainloop()
 
 
