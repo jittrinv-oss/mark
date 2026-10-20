@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mark_ui_kiosk.py v3 — เปิดโปรแกรมตรวจมาร์ค (mark_ui_plus) แบบเต็มจอ + จัดภาพก่อนตรวจ (prealign)
+mark_ui_kiosk.py v4 — เปิดโปรแกรมตรวจมาร์ค (mark_ui_plus) แบบเต็มจอ + จัดภาพก่อนตรวจ (prealign)
 ไม่แก้ไขไฟล์เดิม
 
 v2: ด่านก่อนตรวจ (prealign.py) — จัดภาพ Test ให้ตรง Master, จับคู่ไม่ได้ -> "ถ่ายใหม่"
 v3: ตัวหนังสือภาษาไทยใหญ่และชัดขึ้น
-    - เลือกฟอนต์ไทยที่มีในเครื่องเอง (Pi: Noto Sans Thai / Loma / Garuda, Windows: Leelawadee UI / Tahoma)
-    - ขยายตัวหนังสือทุกปุ่ม/ป้าย/ช่อง (ตั้งค่าได้ที่ FONT_SIZE ด้านล่าง)
-    - ระยะขอบรอบตัวหนังสือในปุ่ม ~0.1 ซม. (4 px) -> ปุ่มไม่บวมแม้ตัวหนังสือใหญ่ขึ้น
-    - ช่องภาพด้านล่างเล็กลงอัตโนมัติตามพื้นที่ที่แถบด้านบนใช้เพิ่ม
+v4: ใช้ Master ที่ prealign v4 จำกัดเขตแล้ว (ตรวจเฉพาะในกรอบเส้นประแดง / พื้นที่มาร์ค)
+    + ภาพกล้องถูกปรับตั้งฉาก -> หัวตาราง / ขอบกระดาษ / เงา ไม่ขึ้น alarm
 
   F11 = สลับเต็มจอ / Esc = ออกจากเต็มจอ
   ไม่ใช้ด่านก่อนตรวจ:  python mark_ui_kiosk.py --no-prealign
@@ -33,12 +31,11 @@ FULLSCREEN = "--fullscreen" in sys.argv
 USE_PREALIGN = "--no-prealign" not in sys.argv and prealign is not None
 ORANGE = "#ef8a00"
 
-# ---------------- ปรับขนาดตัวหนังสือได้ที่นี่ ----------------
-FONT_SIZE = 12          # ตัวหนังสือทั่วไป / ปุ่ม  (เดิม 8-9)
-FONT_SIZE_RUN = 15      # ปุ่ม ▶ ตรวจสอบ
-FONT_SIZE_TAB = 12      # แท็บ
-PAD = 4                 # ระยะขอบรอบตัวหนังสือ (px) ~0.1 ซม.
-KEEP_BIG = 18           # ตัวหนังสือที่ใหญ่อยู่แล้ว (เช่น ป้าย OK/NG) ไม่ย่อ/ไม่แตะขนาด
+FONT_SIZE = 12
+FONT_SIZE_RUN = 15
+FONT_SIZE_TAB = 12
+PAD = 4
+KEEP_BIG = 18
 
 THAI_FONTS = ("Noto Sans Thai", "Noto Sans Thai UI", "Sarabun", "Loma", "Garuda",
               "Leelawadee UI", "Leelawadee", "Tahoma", "Norasi", "Kinnari")
@@ -59,26 +56,22 @@ class KioskApp(Base):
         super().__init__()
         try:
             self._bigger_ui()
-        except Exception as ex:                       # ปรับหน้าตาไม่สำเร็จ ไม่ให้โปรแกรมพัง
+        except Exception as ex:
             print("bigger_ui:", ex)
 
-    # ------------------------------------------------------------ หน้าตา v3
+    # ------------------------------------------------------------ หน้าตา
     def _bigger_ui(self):
         fam = pick_thai_font(self)
         self._thai_font = fam
         if fam is None:
             fam = tkfont.nametofont("TkDefaultFont").actual("family")
-            print("ไม่พบฟอนต์ไทย — ติดตั้งบน Pi: sudo apt install fonts-thai-tlwg fonts-noto-core")
         F = lambda s, w="normal": (fam, s, w)
-
-        # ฟอนต์ตั้งต้นของ Tk (หน้าต่างเลือกไฟล์ / ข้อความแจ้งเตือน / รายการใน Combobox)
         for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont"):
             try:
                 tkfont.nametofont(name).configure(family=fam, size=FONT_SIZE)
             except Exception:
                 pass
         self.option_add("*TCombobox*Listbox.font", F(FONT_SIZE))
-
         st = ttk.Style(self)
         st.configure(".", font=F(FONT_SIZE))
         st.configure("TButton", font=F(FONT_SIZE, "bold"), padding=(PAD, PAD))
@@ -90,11 +83,9 @@ class KioskApp(Base):
         st.configure("TNotebook.Tab", font=F(FONT_SIZE_TAB, "bold"), padding=(PAD * 2, PAD))
         st.configure("Treeview", font=F(FONT_SIZE - 1), rowheight=int((FONT_SIZE + 10) * 1.4))
         st.configure("Treeview.Heading", font=F(FONT_SIZE - 1, "bold"))
-
         self._restyle(self, fam)
 
     def _restyle(self, w, fam):
-        """ไล่ทุกปุ่ม/ป้าย/ช่อง: ใช้ฟอนต์ไทย, ขยายขนาด, ลดระยะขอบ"""
         for c in w.winfo_children():
             cls = c.winfo_class()
             if cls in ("Label", "Entry", "Text", "TEntry", "TCombobox", "Spinbox", "TSpinbox"):
@@ -112,7 +103,7 @@ class KioskApp(Base):
                         if c.winfo_manager() == mgr:
                             info = getattr(c, mgr + "_info")()
                             if "ipady" in info and int(str(info["ipady"]).split()[0]) > 4:
-                                continue                      # ป้าย OK/NG ใหญ่ — ไม่แตะ
+                                continue
                             getattr(c, mgr + "_configure")(padx=2, pady=1)
                     except Exception:
                         pass
@@ -124,7 +115,7 @@ class KioskApp(Base):
                     pass
             self._restyle(c, fam)
 
-    # ------------------------------------------------------------ ด่านก่อนตรวจ (v2)
+    # ------------------------------------------------------------ ด่านก่อนตรวจ
     def _big(self, text, color):
         lbl = self.__dict__.get("big_verdict")
         if lbl is not None:
@@ -154,11 +145,21 @@ class KioskApp(Base):
             self.status.set("⚠ " + " / ".join(r["problems"]) + f"   (จุดอ้างอิง {r['inliers']})")
             return None
         self._orig_test = test.copy()
-        self._pre_msgs = [f"จัดภาพแล้ว: {'กลับด้าน ' if r['mirrored'] else ''}หมุน {r['angle']}°, "
-                          f"จุดอ้างอิง {r['inliers']}"] + ["⚠ " + p for p in r["problems"]]
-        out = super().run_inspect(r["test"])
+        self._pre_msgs = [f"จัดภาพแล้ว: {r.get('warp', '')}{' กลับด้าน' if r['mirrored'] else ''}, "
+                          f"จุดอ้างอิง {r['inliers']}"
+                          + (f", ตรวจเฉพาะ{r['roi']}" if r.get("roi") else "")] \
+            + ["⚠ " + p for p in r["problems"]]
+        # v4: ใช้ Master ที่จำกัดเขตแล้ว ชั่วคราว (ขนาด/ตำแหน่งเท่าเดิม) แล้วคืนค่าเดิม
+        orig_master = self.master_img
+        self.master_img = r.get("master", orig_master)
+        try:
+            out = super().run_inspect(r["test"])
+        finally:
+            self.master_img = orig_master
         if self.__dict__.get("_raw_test") is not None:
             self._raw_test = self._orig_test
+        if self.__dict__.get("_raw_master") is not None:
+            self._raw_master = orig_master
         return out
 
     def _on_result(self, res):
@@ -209,11 +210,6 @@ def main():
     app.bind("<Escape>", leave)
     app.after(300, lambda: maximize(app))
     app.after(2500, lambda: maximize(app))
-    if getattr(app, "_thai_font", None) is None:
-        try:
-            app.status.set("⚠ ไม่พบฟอนต์ไทย — บน Pi พิมพ์: sudo apt install fonts-thai-tlwg fonts-noto-core")
-        except Exception:
-            pass
     app.mainloop()
 
 

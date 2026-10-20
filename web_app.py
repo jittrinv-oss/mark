@@ -1,28 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-web_app.py v2 — ใช้โปรแกรมตรวจมาร์คผ่าน "เว็บเบราว์เซอร์" (มือถือ / iPad / PC)
+web_app.py v3 — ใช้โปรแกรมตรวจมาร์คผ่าน "เว็บเบราว์เซอร์" (มือถือ / iPad / PC)
 ไม่แก้ไฟล์เดิม: เรียกใช้ตัวตรวจเดิม (glyph_check) + ส่วนเสริมที่มีในโฟลเดอร์
 
-v2: ตรวจเร็วขึ้นมาก
-  - มือถือ "ย่อรูปก่อนส่ง" (ด้านยาว 1600 px, JPEG) -> ส่งเร็วผ่าน hotspot (เดิมส่งรูปเต็ม 4-12 MB)
-  - ฝั่ง Pi ย่อรูป Master/Test ที่ใหญ่เกิน MAX_SIDE อีกชั้น (เผื่อเบราว์เซอร์ที่ย่อไม่ได้)
-    เดิม: รูปกล้องมือถือ 4000x3000 ขึ้นไป -> ตัวตรวจทำงานบนรูปเต็ม -> ช้ามาก
-  - Master เดิมเก็บไว้ในหน่วยความจำ ไม่ต้องอ่าน/แปลงใหม่ทุกครั้ง
-  - แสดงเวลาที่ใช้แต่ละขั้น (อัปโหลด / ตรวจ) ในหน้าผล
-รัน:  python web_app.py [พอร์ต]       iPad/มือถือ: http://<IP>:8080
+v2: มือถือย่อรูปก่อนส่ง (1600 px) + Pi ย่อซ้ำ + จำ Master เดิม + แสดงเวลา
+v3: - ใช้ Master ที่ prealign v4 จำกัดเขตแล้ว (ปรับตั้งฉาก + ตรวจเฉพาะในกรอบแดง)
+    - หน้าเว็บไม่ถูกแคช (มือถือได้หน้าใหม่ทุกครั้ง) / แก้ข้อความ __CLIENT_SECS__
+รัน:  python web_app.py [พอร์ต]       มือถือ: http://<IP>:8080
 """
-import base64
-import csv
-import html
-import json
-import os
-import re
-import socket
-import sys
-import tempfile
-import threading
-import time
+import base64, csv, html, json, os, re, socket, sys, tempfile, threading, time
 from email import policy
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,7 +24,7 @@ sys.path.insert(0, BASE)
 RESULTS = os.path.join(BASE, "results")
 LAST_MASTER = os.path.join(RESULTS, "_web_last_master.png")
 MAX_UPLOAD = 60 * 1024 * 1024
-MAX_SIDE = 1600              # v2: ด้านยาวสูงสุดของรูปที่ใช้ตรวจ (px)
+MAX_SIDE = 1600
 LOCK = threading.Lock()
 _MASTER_CACHE = {"img": None, "mtime": 0}
 
@@ -62,19 +49,15 @@ def safe_name(s):
 
 
 def shrink(img, max_side=MAX_SIDE):
-    """v2: ย่อรูปที่ใหญ่เกิน (รูปกล้องมือถือ) — ตัวอักษรยังคมพอสำหรับการตรวจ"""
     if img is None:
         return img
     h, w = img.shape[:2]
     s = max_side / float(max(h, w))
-    if s >= 1:
-        return img
-    return cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+    return img if s >= 1 else cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
 
 
 def decode_image(data):
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    return shrink(img)
+    return shrink(cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR))
 
 
 def is_pdf(data, name):
@@ -89,8 +72,7 @@ def to_tmp_pdf(data):
 
 
 def jpg_b64(img, long_side=900):
-    img = shrink(img, long_side)
-    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    ok, buf = cv2.imencode(".jpg", shrink(img, long_side), [cv2.IMWRITE_JPEG_QUALITY, 80])
     return base64.b64encode(buf.tobytes()).decode()
 
 
@@ -101,9 +83,8 @@ def imwrite(path, img):
 
 
 def load_ignores(model):
-    p = os.path.join(RESULTS, safe_name(model), "config.json")
     try:
-        with open(p, encoding="utf-8") as f:
+        with open(os.path.join(RESULTS, safe_name(model), "config.json"), encoding="utf-8") as f:
             return json.load(f).get("ignore", [])
     except Exception:
         return []
@@ -114,8 +95,7 @@ def get_last_master():
         return None
     mt = os.path.getmtime(LAST_MASTER)
     if _MASTER_CACHE["img"] is None or _MASTER_CACHE["mtime"] != mt:
-        _MASTER_CACHE["img"] = cv2.imdecode(np.fromfile(LAST_MASTER, np.uint8), cv2.IMREAD_COLOR)
-        _MASTER_CACHE["mtime"] = mt
+        _MASTER_CACHE.update(img=cv2.imdecode(np.fromfile(LAST_MASTER, np.uint8), cv2.IMREAD_COLOR), mtime=mt)
     return _MASTER_CACHE["img"]
 
 
@@ -164,17 +144,20 @@ def run_check(model, master_bytes, master_name, test_bytes, test_name, use_last)
     raw_test = test.copy()
     msgs.append(f"ขนาดรูป Master {master.shape[1]}x{master.shape[0]}  Test {test.shape[1]}x{test.shape[0]}")
 
+    m_check = master
     if prealign is not None:
         pr = prealign.prealign(master, test)
         if not pr["ok"]:
             return dict(verdict="ถ่ายใหม่", msgs=msgs + pr["problems"], result=None,
                         master=master, test=raw_test, folder=None, secs=time.time() - t0)
         test = pr["test"]
-        msgs += [f"จัดภาพแล้ว (จุดอ้างอิง {pr['inliers']})"] + pr["problems"]
-    m2 = master
+        m_check = pr.get("master", master)                 # v3: Master ที่จำกัดเขตแล้ว
+        msgs += [f"จัดภาพแล้ว: {pr.get('warp', '')} (จุดอ้างอิง {pr['inliers']})"
+                 + (f", ตรวจเฉพาะ{pr['roi']}" if pr.get("roi") else "")] + pr["problems"]
+    m2 = m_check
     if test_polarity is not None:
         try:
-            m2, test, pm = test_polarity.prepare_pair(master, test)
+            m2, test, pm = test_polarity.prepare_pair(m_check, test)
             if pm:
                 msgs.append(pm)
         except Exception as ex:
@@ -185,10 +168,8 @@ def run_check(model, master_bytes, master_name, test_bytes, test_name, use_last)
     ignores = load_ignores(model)
     rep, overlay, aligned, *_ = glyph_check.inspect_glyph(m2, test, ignores, None)
     verdict = rep.get("verdict", "?")
-    if hasattr(glyph_check, "draw_result"):
-        res_img = glyph_check.draw_result(aligned, rep.get("elements", []), rep.get("extras", []), ignores, False)
-    else:
-        res_img = overlay
+    res_img = (glyph_check.draw_result(aligned, rep.get("elements", []), rep.get("extras", []), ignores, False)
+               if hasattr(glyph_check, "draw_result") else overlay)
     bad = [e for e in rep.get("elements", []) if e.get("status") in ("MISSING", "PARTIAL")]
     msgs.append(f"ชิ้นส่วน {rep.get('n_elements', '?')}  หายทั้งชิ้น {rep.get('n_missing', 0)}  "
                 f"จางขาดหาย {rep.get('n_partial', 0)}  align {rep.get('align_method', '')}")
@@ -243,7 +224,6 @@ img{max-width:100%;border-radius:8px}
 .msg{font-size:16px;color:#333;margin:4px 0}.small{color:#666;font-size:15px}
 """
 
-# v2: ย่อรูปในเบราว์เซอร์ก่อนส่ง (ด้านยาว 1600, JPEG 0.9) — PDF ส่งตามเดิม
 JS = """
 <script>
 const MAXS = %d;
@@ -266,19 +246,18 @@ async function go(ev){
   ev.preventDefault();
   const f=ev.target, btn=document.getElementById('go'), t0=Date.now();
   btn.disabled=true; btn.innerText='กำลังย่อรูป…';
-  const fd=new FormData();
+  const fd=new FormData(); fd.append('js','1');
   for(const el of f.elements){
     if(!el.name) continue;
     if(el.type==='file'){ if(el.files[0]) fd.append(el.name, await shrinkFile(el.files[0])); }
     else if(el.type==='checkbox'){ if(el.checked) fd.append(el.name, el.value); }
     else fd.append(el.name, el.value);
   }
-  btn.innerText='กำลังส่ง + ตรวจ…';
   const tick=setInterval(()=>{btn.innerText='กำลังตรวจ… '+Math.round((Date.now()-t0)/1000)+' วินาที';},1000);
   try{
     const r=await fetch('/inspect',{method:'POST',body:fd});
-    const html=await r.text(); clearInterval(tick);
-    document.open(); document.write(html.replace('__CLIENT_SECS__',((Date.now()-t0)/1000).toFixed(1))); document.close();
+    const h=await r.text(); clearInterval(tick);
+    document.open(); document.write(h.replace('__CLIENT_SECS__',((Date.now()-t0)/1000).toFixed(1))); document.close();
   }catch(e){ clearInterval(tick); btn.disabled=false; btn.innerText='▶ ตรวจสอบ'; alert('ส่งไม่สำเร็จ: '+e); }
 }
 </script>
@@ -295,7 +274,7 @@ def page_form(model="", note=""):
     warn = f'<p class="msg" style="color:#d62828">⚠ ไม่พบไฟล์: {html.escape(mods)}</p>' if mods else ""
     return f"""<!doctype html><html lang="th"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>ตรวจมาร์ค</title><style>{CSS}</style>{JS}</head>
-<body><header>ระบบตรวจมาร์คกระจก — AATH (เว็บ)</header><div class="wrap">{warn}
+<body><header>ระบบตรวจมาร์คกระจก — AATH (เว็บ v3)</header><div class="wrap">{warn}
 <form method="post" action="/inspect" enctype="multipart/form-data" onsubmit="go(event)">
 <div class="card"><label>โมเดล</label><input type="text" name="model" value="{html.escape(model)}" placeholder="เช่น 3DA-J0"></div>
 <div class="card"><label>Master (ภาพ หรือ PDF)</label>
@@ -307,23 +286,22 @@ def page_form(model="", note=""):
 <p class="msg">{html.escape(note)}</p></div></body></html>"""
 
 
-def page_result(r, model):
+def page_result(r, model, from_js):
     v = r["verdict"]
     cls = "OK" if v == "OK" else ("NG" if v == "NG" else "RE")
-    imgs = []
-    for title, im in (("ผลตรวจ", r.get("result")), ("Test", r.get("test")), ("Master", r.get("master"))):
-        if im is not None:
-            imgs.append(f'<div class="card"><b>{title}</b><br><img src="data:image/jpeg;base64,{jpg_b64(im)}"></div>')
+    imgs = "".join(f'<div class="card"><b>{t}</b><br><img src="data:image/jpeg;base64,{jpg_b64(im)}"></div>'
+                   for t, im in (("ผลตรวจ", r.get("result")), ("Test", r.get("test")), ("Master", r.get("master")))
+                   if im is not None)
     msgs = "".join(f'<p class="msg">• {html.escape(m)}</p>' for m in r["msgs"])
     saved = f'<p class="small">บันทึกที่ {html.escape(r["folder"])}</p>' if r.get("folder") else ""
-    timing = (f'<p class="small">เวลา: ตรวจบน Pi {r.get("secs", 0):.1f} วินาที  |  '
-              f'รวมส่ง+ตรวจ __CLIENT_SECS__ วินาที</p>')
+    total = "__CLIENT_SECS__" if from_js else "-"
+    timing = f'<p class="small">เวลา: ตรวจบน Pi {r.get("secs", 0):.1f} วินาที  |  รวมส่ง+ตรวจ {total} วินาที</p>'
     return f"""<!doctype html><html lang="th"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>ผล {html.escape(v)}</title><style>{CSS}</style></head>
 <body><header>ผลตรวจ — {html.escape(safe_name(model))}</header><div class="wrap">
 <div class="v {cls}">{html.escape(v)}</div>
 <a class="btn" href="/?model={html.escape(model)}">↩ ตรวจชิ้นถัดไป</a>
-<div class="card">{msgs}{saved}{timing}</div><div class="row">{''.join(imgs)}</div></div></body></html>"""
+<div class="card">{msgs}{saved}{timing}</div><div class="row">{imgs}</div></div></body></html>"""
 
 
 def parse_multipart(handler):
@@ -347,10 +325,11 @@ def parse_multipart(handler):
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, html_text, code=200):
-        b = html_text.encode("utf-8")
+    def _send(self, text, code=200):
+        b = text.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")          # v3: มือถือไม่ใช้หน้าเก่าจากแคช
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
         self.wfile.write(b)
@@ -368,7 +347,7 @@ class Handler(BaseHTTPRequestHandler):
             tfn, tdata = files.get("test_cam") or files.get("test") or (None, None)
             with LOCK:
                 r = run_check(model, mdata, mfn, tdata, tfn, fields.get("use_last") == "1")
-            self._send(page_result(r, model))
+            self._send(page_result(r, model, fields.get("js") == "1"))
         except Exception as ex:
             self._send(page_form(model, f"⚠ {ex}"))
 
@@ -377,21 +356,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def local_ips():
-    ips = set()
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("10.255.255.255", 1))
-        ips.add(s.getsockname()[0])
+        ip = s.getsockname()[0]
         s.close()
+        return [ip]
     except Exception:
-        pass
-    return sorted(ips) or ["<IP ของเครื่องนี้>"]
+        return ["<IP ของเครื่องนี้>"]
 
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print("โปรแกรมตรวจมาร์ค (เว็บ v2) พร้อมแล้ว — เปิดบน iPad / มือถือ:")
+    print("โปรแกรมตรวจมาร์ค (เว็บ v3) พร้อมแล้ว — เปิดบน iPad / มือถือ:")
     for ip in local_ips():
         print(f"   http://{ip}:{port}")
     print("ปิด: กด Ctrl+C")
