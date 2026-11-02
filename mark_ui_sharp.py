@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mark_ui_sharp.py v1.3 — โปรแกรมตรวจมาร์ค + "ตัวตรวจคมชัด" (sharp_check.py)
+mark_ui_sharp.py v1.4 — โปรแกรมตรวจมาร์ค + "ตัวตรวจคมชัด" (sharp_check.py)
 ไม่แก้ไฟล์เดิม: ต่อยอดจาก mark_ui_kiosk -> mark_ui_plus -> mark_ui
-
+v1.4: - Test จาก PDF: ใช้ pdf_autofind v3 -> ภาพ Test เห็น "มาร์คเต็มก้อน" (เดิมตัดเท่ากรอบ Master)
+      - เตือนเมื่อมาร์คใน PDF เรียง/มีข้อความต่างจาก Master (เช่น มี QR / เลขพาร์ท / S27413 เพิ่ม)
+      - โหลด Test ใหม่ -> ล้างช่องผลตรวจ/ป้าย OK-NG ของครั้งก่อน (ไม่ค้างภาพผลเก่า)
 v1.3: เรียก sharp_fix.py (แพตช์ตัวตรวจ) อัตโนมัติ — ไม่ต้องเปลี่ยนไฟล์ .bat
 v1.2: - ขึ้น "ถ่ายใหม่" แล้วช่องผลตรวจแสดงภาพ Test ปัจจุบัน (เดิมค้างภาพผลของครั้งก่อน)
       - ข้อความแถบล่างบอกเหตุผลถ่ายใหม่ชัดเจน
@@ -15,18 +17,15 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk
-
 import cv2
-
 import mark_ui
 import sharp_check as SC
 try:
     import sharp_fix  # noqa: F401  v1.3 แพตช์ (กรอบเส้นประ / ส้มผิด / Test จาก PDF)
-    SHARP_VER = "v1.3"
+    SHARP_VER = "v1.4"
 except Exception as _ex:
     print("sharp_fix:", _ex)
     SHARP_VER = "v1.2"
-
 try:
     from mark_ui_kiosk import KioskApp as Base, maximize
 except Exception:
@@ -37,6 +36,7 @@ except Exception:
         from mark_ui import App as Base
 
 ORANGE = "#ef8a00"
+IDLE_GREY = "#9aa5b1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -125,6 +125,72 @@ class SharpApp(Base):
         except Exception:
             pass
 
+    # ---------------------------------------------------------- v1.4: ล้างผลเก่าเมื่อเปลี่ยน Test
+    def _clear_result(self, img=None):
+        try:
+            self._big("—", IDLE_GREY)
+        except Exception:
+            pass
+        if hasattr(self, "_show_verdict"):
+            try:
+                self._show_verdict("")
+            except Exception:
+                pass
+        pn = self.__dict__.get("pn_result")
+        if pn is not None:
+            try:
+                pn.config(highlightbackground=IDLE_GREY, highlightcolor=IDLE_GREY, highlightthickness=8)
+            except Exception:
+                pass
+        if img is not None:
+            self._show_result_img(img, "ผลตรวจ : ยังไม่ได้ตรวจ — กด ▶ ตรวจสอบ")
+        # ป้ายเล็กข้างปุ่มตรวจสอบ (mark_ui) — ถ้ามี
+        for name in ("verdict", "verdict_lbl", "lbl_verdict"):
+            w = self.__dict__.get(name)
+            if isinstance(w, tk.Label):
+                try:
+                    w.config(text="—", bg=IDLE_GREY)
+                except Exception:
+                    pass
+
+    def _show_test(self, img, path, title):
+        super()._show_test(img, path, title)
+        self._clear_result(img)
+
+    def test_from_pdf(self, path=None):
+        """v1.4: หามาร์คใน PDF แบบเต็มก้อน + เตือน layout ต่างจาก Master"""
+        from tkinter import filedialog, messagebox
+        if self.master_img is None:
+            messagebox.showwarning(mark_ui.APP, "เลือก Master ก่อน (ภาพมาร์คที่อ่านได้ปกติ)\n"
+                                   "โปรแกรมใช้ Master เป็นแบบในการหามาร์คใน PDF")
+            return
+        p = path or filedialog.askopenfilename(title="เลือก PDF (Order screen) สำหรับ Test",
+                                               filetypes=[("PDF", "*.pdf")])
+        if not p:
+            return
+        self.status.set("กำลังหามาร์คใน PDF (zoom / mirror / หมุน อัตโนมัติ) … บน Pi อาจใช้ 1-2 นาที")
+        self._big("…", IDLE_GREY)
+        self.update_idletasks()
+        try:
+            from pdf_autofind import find_mark_in_pdf
+            r = find_mark_in_pdf(p, self.master_img)
+        except Exception as ex:
+            self._clear_result()
+            messagebox.showerror(mark_ui.APP, f"หามาร์คใน PDF ไม่สำเร็จ:\n{ex}")
+            self.status.set("หามาร์คใน PDF ไม่สำเร็จ")
+            return
+        self._show_test(r["test"], p, "Test (จาก PDF — มาร์คเต็ม ปรับทิศแล้ว)")
+        msg = (f"พบมาร์คใน PDF: กลับด้าน={'ใช่' if r['mirrored'] else 'ไม่'}  หมุน {r['angle']}°  "
+               f"จุดอ้างอิง {r['inliers']} ({r.get('quality', '')})")
+        if r.get("layout_note"):
+            msg += "  |  " + r["layout_note"]
+        self.status.set(msg + "  — กด ▶ ตรวจสอบ")
+        if r.get("layout_diff"):
+            messagebox.showwarning(mark_ui.APP, r["layout_note"].replace(" | ", "\n").replace(" — ", "\n") +
+                                   "\n\nดูภาพ Test เทียบกับ Master ก่อนกดตรวจสอบ\n"
+                                   "(ส่วนที่อยู่นอกกรอบ Master เช่น QR / เลขพาร์ท จะไม่ถูกตรวจ)")
+
+    # ---------------------------------------------------------- กล้อง / ตรวจ
     def cam_grab(self):
         cap = getattr(self, "cap", None)
         if not getattr(self, "live", False) or cap is None or self.use_sharp is None or not self.use_sharp.get():
@@ -158,7 +224,7 @@ class SharpApp(Base):
                            time.strftime("%H%M%S") + "_debug") if cfg["debug_save"] else None
         cont = bool(self.cont_blur.get())
         self.busy = True
-        self._big("…", "#9aa5b1")
+        self._big("…", IDLE_GREY)
         self.status.set("ตัวตรวจคมชัด กำลังตรวจ …")
         self._raw_test = test.copy()
         self._raw_master = master
