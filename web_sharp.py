@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-web_sharp.py v1 — เว็บตรวจมาร์ค (มือถือ / iPad) + ตัวตรวจคมชัด (sharp_check.py)
+web_sharp.py v1.3 — เว็บตรวจมาร์ค (มือถือ / iPad) + ตัวตรวจคมชัด (sharp_check.py)
 ไม่แก้ไฟล์เดิม: ใช้หน้าเว็บ/ฟังก์ชันของ web_app.py แล้วเพิ่ม 2 ติ๊ก
   ☑ ใช้ตัวตรวจคมชัด    ☐ ตรวจต่อแม้ภาพเบลอ
 รัน:  python web_sharp.py [พอร์ต]   (แทน web_app.py)
@@ -12,6 +12,10 @@ from http.server import ThreadingHTTPServer
 import cv2
 import web_app as W
 import sharp_check as SC
+try:
+    import sharp_fix  # noqa: F401  v1.3 แพตช์ (กรอบเส้นประ / ส้มผิด / Test จาก PDF)
+except Exception as _ex:
+    print("sharp_fix:", _ex)
 
 EXTRA_HTML = ('<div class="card"><label><input type="checkbox" name="sharp" value="1" checked> '
               'ใช้ตัวตรวจคมชัด (ภาพเบลอ / กล้อง res ต่ำ)</label>'

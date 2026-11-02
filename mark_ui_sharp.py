@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mark_ui_sharp.py v1 — โปรแกรมตรวจมาร์ค + "ตัวตรวจคมชัด" (sharp_check.py) สำหรับภาพเบลอ / กล้องความละเอียดต่ำ
-ไม่แก้ไฟล์เดิม: ต่อยอดจาก mark_ui_kiosk (เต็มจอ / ตัวหนังสือใหญ่ / prealign) -> mark_ui_plus -> mark_ui
+mark_ui_sharp.py v1.3 — โปรแกรมตรวจมาร์ค + "ตัวตรวจคมชัด" (sharp_check.py)
+ไม่แก้ไฟล์เดิม: ต่อยอดจาก mark_ui_kiosk -> mark_ui_plus -> mark_ui
 
-เพิ่ม:
-  ☑ ใช้ตัวตรวจคมชัด        เปิด = ใช้ sharp_check / ปิด = ตัวตรวจเดิม (glyph_check v9) ทุกอย่างเหมือนเดิม
-  ☐ ตรวจต่อแม้ภาพเบลอ      ปิด = ภาพเบลอขึ้น "ถ่ายใหม่" (ไม่ตัด NG) / เปิด = ตรวจต่อ
-  [ตั้งค่าคมชัด]            เปิดไฟล์ sharp_config.json (ค่าทุกตัวอยู่ที่นี่)
-  กล้อง: เปิดที่ความละเอียดสูงสุดที่กล้องรองรับ (เดิมกล้อง 2K เปิดได้แค่ 640x480)
-  📷 จับภาพ+ตรวจ: ถ่ายหลายเฟรม เลือกเฟรมคมสุด / เฉลี่ย (ตั้งใน config)
-  ภาพ debug ทุกขั้น: results/<โมเดล>/<วัน>/<เวลา>_<ผล>_debug/
+v1.3: เรียก sharp_fix.py (แพตช์ตัวตรวจ) อัตโนมัติ — ไม่ต้องเปลี่ยนไฟล์ .bat
+v1.2: - ขึ้น "ถ่ายใหม่" แล้วช่องผลตรวจแสดงภาพ Test ปัจจุบัน (เดิมค้างภาพผลของครั้งก่อน)
+      - ข้อความแถบล่างบอกเหตุผลถ่ายใหม่ชัดเจน
 """
 import os
 import subprocess
@@ -24,6 +20,12 @@ import cv2
 
 import mark_ui
 import sharp_check as SC
+try:
+    import sharp_fix  # noqa: F401  v1.3 แพตช์ (กรอบเส้นประ / ส้มผิด / Test จาก PDF)
+    SHARP_VER = "v1.3"
+except Exception as _ex:
+    print("sharp_fix:", _ex)
+    SHARP_VER = "v1.2"
 
 try:
     from mark_ui_kiosk import KioskApp as Base, maximize
@@ -38,9 +40,7 @@ ORANGE = "#ef8a00"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-# ------------------------------------------------------------------ กล้องความละเอียดสูง
 def open_camera_hi(index, backend_id=None, width=1920, height=1080):
-    """ลองความละเอียดสูง -> ต่ำ (ตั้ง MJPG ก่อนตั้งขนาด) คืน (cap, (w,h)) ที่ได้ภาพจริงขนาดใหญ่สุด"""
     backs = [backend_id] if backend_id is not None else (
         [cv2.CAP_DSHOW, cv2.CAP_MSMF] if sys.platform == "win32" else [cv2.CAP_V4L2])
     sizes = [(2560, 1440), (1920, 1080), (1600, 1200), (1280, 960), (1280, 720)]
@@ -62,7 +62,7 @@ def open_camera_hi(index, backend_id=None, width=1920, height=1080):
             if fr is not None and fr.shape[1] >= min(w, 1280):
                 return cap, (fr.shape[1], fr.shape[0])
             cap.release()
-    return mark_ui._orig_open_camera(index, backend_id)       # สำรอง = แบบเดิม
+    return mark_ui._orig_open_camera(index, backend_id)
 
 
 if not hasattr(mark_ui, "_orig_open_camera"):
@@ -70,11 +70,19 @@ if not hasattr(mark_ui, "_orig_open_camera"):
     mark_ui.open_camera = open_camera_hi
 
 
+def mark_ui_plus_safe(name):
+    try:
+        from mark_ui_plus import safe_model_name
+        return safe_model_name(name)
+    except Exception:
+        return name or "_ไม่ระบุโมเดล"
+
+
 class SharpApp(Base):
     def __init__(self):
         self.use_sharp = None
         super().__init__()
-        self.title(mark_ui.APP + "  (+ ตัวตรวจคมชัด)")
+        self.title(mark_ui.APP + f"  (+ ตัวตรวจคมชัด {SHARP_VER})")
         cfg = SC.load_config()
         self.use_sharp = tk.BooleanVar(value=True)
         self.cont_blur = tk.BooleanVar(value=bool(cfg.get("continue_if_blur", False)))
@@ -90,7 +98,7 @@ class SharpApp(Base):
             bar.pack(fill="x", padx=6)
 
     def open_cfg(self):
-        SC.load_config()                                    # สร้างไฟล์ถ้ายังไม่มี
+        SC.load_config()
         try:
             if sys.platform == "win32":
                 os.startfile(SC.CONFIG_FILE)
@@ -106,7 +114,17 @@ class SharpApp(Base):
         if lbl is not None:
             lbl.config(text=text, bg=color)
 
-    # -------------------------------------------------------------- จับภาพหลายเฟรม
+    def _show_result_img(self, img, title):
+        pn = self.__dict__.get("pn_result")
+        if pn is None or img is None:
+            return
+        try:
+            if hasattr(pn, "title_var"):
+                pn.title_var.set(title)
+            pn.set(img)
+        except Exception:
+            pass
+
     def cam_grab(self):
         cap = getattr(self, "cap", None)
         if not getattr(self, "live", False) or cap is None or self.use_sharp is None or not self.use_sharp.get():
@@ -125,7 +143,6 @@ class SharpApp(Base):
         self._grab_note = f"เลือกเฟรมคมสุด {max(scores):.0f} จาก {len(frames)} เฟรม ({cfg['frame_mode']})"
         self.run_inspect(self.test_img)
 
-    # -------------------------------------------------------------- ตรวจ
     def run_inspect(self, frame=None):
         if self.use_sharp is None or not self.use_sharp.get():
             return super().run_inspect(frame)
@@ -167,24 +184,23 @@ class SharpApp(Base):
         if gn:
             notes.insert(0, gn)
             self._grab_note = ""
-        if r["debug_dir"]:
+        if r.get("debug_dir"):
             notes.append("debug: " + os.path.relpath(r["debug_dir"], BASE_DIR))
         if r["verdict"] == "RETAKE":
             self._big("ถ่ายใหม่", ORANGE)
-            if r.get("aligned") is not None and self.__dict__.get("pn_result") is not None:
-                self.pn_result.set(r["aligned"])
-            self.status.set("⚠ " + "   |   ".join(notes))
+            # v1.2: ไม่ค้างภาพผลครั้งก่อน — แสดงภาพ Test ปัจจุบัน
+            self._show_result_img(r.get("test_view") if r.get("test_view") is not None else self._raw_test,
+                                  "ผลตรวจ : ถ่ายใหม่ (ยังไม่ตัดสิน)")
+            pn = self.__dict__.get("pn_result")
+            if pn is not None:
+                try:
+                    pn.config(highlightbackground=ORANGE, highlightcolor=ORANGE, highlightthickness=8)
+                except Exception:
+                    pass
+            self.status.set("⚠ ถ่ายใหม่ | " + "   |   ".join(notes))
             return
-        self._pre_msgs = ["ตัวตรวจคมชัด"] + notes
+        self._pre_msgs = [f"ตัวตรวจคมชัด {SHARP_VER}"] + notes
         super()._on_result((r["report"], r["overlay"], r["aligned"]))
-
-
-def mark_ui_plus_safe(name):
-    try:
-        from mark_ui_plus import safe_model_name
-        return safe_model_name(name)
-    except Exception:
-        return name or "_ไม่ระบุโมเดล"
 
 
 def main():
