@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-web_sharp.py v1.4 — เว็บตรวจมาร์ค (มือถือ / iPad) + ตัวตรวจคมชัด (sharp_check.py)
+web_sharp.py v1.5 — เว็บตรวจมาร์ค (มือถือ / iPad) + ตัวตรวจคมชัด (sharp_check.py)
 ไม่แก้ไฟล์เดิม: ใช้หน้าเว็บ/ฟังก์ชันของ web_app.py
-v1.4: - ไม่มี "ถ่ายใหม่" (ส้ม) — ตรวจต่อเสมอ, spec หลวม, ไม่มีกรอบม่วง (sharp_loose.py)
-      - ภาพผลตรวจแสดงกรอบ OK (เขียว) อัตโนมัติ
-      - ช่อง "match ขั้นต่ำ %" (ค่าเริ่ม 50)
-      - ครอบรูป Test บนหน้าเว็บ: เลือก/ถ่ายรูป แล้วลากนิ้วบนภาพ (ส่งพิกัดไปครอบที่ Pi)
+v1.5: แก้ "align() takes 4 positional arguments but 5 were given" (ใช้ sharp_loose v2)
+      ตรวจพลาด -> แสดงข้อความ error พร้อมเหตุผล (ไม่ทิ้งหน้าเปล่า)
+v1.4: ไม่มีถ่ายใหม่ / spec หลวม / ไม่มีม่วง / กรอบ OK / match ขั้นต่ำ % / ครอบรูป Test บนเว็บ
 รัน:  python web_sharp.py [พอร์ต]   (แทน web_app.py)
 """
-import csv, json, os, sys, time
+import csv, json, os, sys, time, traceback
 from http.server import ThreadingHTTPServer
 import numpy as np
 import cv2
@@ -19,17 +18,14 @@ try:
     import sharp_fix  # noqa: F401
 except Exception as _ex:
     print("sharp_fix:", _ex)
-try:
-    import sharp_loose  # noqa: F401  v1.4
-except Exception as _ex:
-    print("sharp_loose:", _ex)
+import sharp_loose  # noqa: F401  v2 (ต้องมี)
 
 CROP_JS = r"""
 <script>
 (function(){
- const c=document.getElementById('cc'), g=c.getContext('2d'); let img=new Image(), box=null, st=null;
+ const c=document.getElementById('cc'); if(!c)return; const g=c.getContext('2d'); let img=new Image(), box=null, st=null;
  function setv(){['cx0','cy0','cx1','cy1'].forEach((k,i)=>document.getElementById(k).value=box?box[i].toFixed(4):'');
-   document.getElementById('cinfo').innerText=box?'ครอบแล้ว ✔ (ส่งไปตรวจเฉพาะในกรอบ)':'ยังไม่ครอบ — ตรวจทั้งภาพ';}
+   document.getElementById('cinfo').innerText=box?'ครอบแล้ว ✔ (ตรวจเฉพาะในกรอบ)':'ยังไม่ครอบ — ตรวจทั้งภาพ';}
  function draw(){ if(!img.naturalWidth)return; c.style.display='block';
    const W=Math.min(1400,img.naturalWidth); c.width=W; c.height=Math.round(W*img.naturalHeight/img.naturalWidth);
    g.drawImage(img,0,0,c.width,c.height);
@@ -135,26 +131,27 @@ def run_sharp(model, mdata, mname, tdata, tname, use_last, fields):
     mdl = W.safe_name(model)
     now = time.localtime()
     folder = os.path.join(W.RESULTS, mdl, time.strftime("%Y%m%d", now), time.strftime("%H%M%S", now) + "_web_sharp")
-    r = SC.inspect(master, test, cfg, W.load_ignores(model), folder + "_debug" if cfg["debug_save"] else None, True)
-    verdict = {"RETAKE": "NG"}.get(r["verdict"], r["verdict"])
-    msgs += ["ตัวตรวจคมชัด"] + r["notes"]
-    out = dict(verdict=verdict, msgs=msgs, result=r["overlay"], master=master, test=test, folder=None,
+    r = SC.inspect(master, test, cfg, W.load_ignores(model), folder + "_debug" if cfg.get("debug_save") else None, True)
+    verdict = "NG" if r["verdict"] == "RETAKE" else r["verdict"]
+    msgs += ["ตัวตรวจคมชัด"] + list(r.get("notes", []))
+    out = dict(verdict=verdict, msgs=msgs, result=r.get("overlay"), master=master, test=test, folder=None,
                secs=time.time() - t0)
-    if r["report"] is not None:
+    rep = r.get("report")
+    if rep is not None:
         folder = folder.replace("_web_sharp", f"_{verdict}_web_sharp")
         os.makedirs(folder, exist_ok=True)
         W.imwrite(os.path.join(folder, "1_master.png"), master)
         W.imwrite(os.path.join(folder, "2_test.png"), test)
-        if r["overlay"] is not None:
+        if r.get("overlay") is not None:
             W.imwrite(os.path.join(folder, "3_result.png"), r["overlay"])
-        rep = r["report"]
         bad = [e for e in rep["elements"] if e["status"] in ("MISSING", "PARTIAL")]
         with open(os.path.join(folder, "report.json"), "w", encoding="utf-8") as f:
             json.dump(dict(verdict=verdict, model=mdl, notes=msgs, defects=bad,
-                           match_min=cfg.get("match_min")), f, indent=2, ensure_ascii=False)
-        row = [time.strftime("%Y-%m-%d %H:%M:%S", now), mdl, verdict, rep["n_missing"], rep["n_partial"],
+                           match_min=cfg.get("match_min")), f, indent=2, ensure_ascii=False, default=str)
+        row = [time.strftime("%Y-%m-%d %H:%M:%S", now), mdl, verdict, rep.get("n_missing", 0), rep.get("n_partial", 0),
                " ".join(f"#{e['id']}" for e in bad), mname or "(เดิม)", tname, os.path.relpath(folder, W.RESULTS)]
         for log in (os.path.join(W.RESULTS, mdl, "log.csv"), os.path.join(W.RESULTS, "log_all.csv")):
+            os.makedirs(os.path.dirname(log), exist_ok=True)
             new = not os.path.exists(log)
             with open(log, "a", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
@@ -185,10 +182,10 @@ class Handler(W.Handler):
                 r = run_sharp(model, mdata, mfn, tdata, tfn, fields.get("use_last") == "1", fields)
             self._send(_page_result(r, model, fields.get("js") == "1"))
         except Exception as ex:
-            self._send(page_form(model, f"⚠ {ex}"))
+            traceback.print_exc()
+            self._send(page_form(model, f"⚠ ตรวจไม่สำเร็จ: {ex}  (ดูรายละเอียดในหน้าต่าง Terminal ของ Pi)"))
 
     def _legacy(self, fields, files):
-        """ไม่ติ๊กคมชัด = ตรวจด้วยตัวตรวจเดิมของ web_app (glyph_check)"""
         mfn, mdata = files.get("master", (None, None))
         tfn, tdata = files.get("test_cam") or files.get("test") or (None, None)
         with W.LOCK:
@@ -199,7 +196,7 @@ class Handler(W.Handler):
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print("โปรแกรมตรวจมาร์ค (เว็บ + ตัวตรวจคมชัด v1.4) พร้อมแล้ว:")
+    print(f"โปรแกรมตรวจมาร์ค (เว็บ + ตัวตรวจคมชัด v1.5, {SC.VERSION}) พร้อมแล้ว:")
     for ip in W.local_ips():
         print(f"   http://{ip}:{port}")
     try:

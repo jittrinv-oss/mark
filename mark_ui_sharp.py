@@ -1,35 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mark_ui_sharp.py v1.5 — โปรแกรมตรวจมาร์ค + "ตัวตรวจคมชัด" (sharp_check.py)
+mark_ui_sharp.py v1.6 — โปรแกรมตรวจมาร์ค + "ตัวตรวจคมชัด" (sharp_check.py)
 ไม่แก้ไฟล์เดิม: ต่อยอดจาก mark_ui_kiosk -> mark_ui_plus -> mark_ui
-v1.5: - ไม่มี "ถ่ายใหม่" (ส้ม) แล้ว — ตรวจต่อเสมอ (sharp_loose.py)
-      - ปุ่ม "✂ ครอบรูป Test" ลากกรอบครอบภาพที่ถ่าย + "จำกรอบ" ใช้กับภาพกล้องถัดไปอัตโนมัติ
-      - ช่อง "match ขั้นต่ำ %" (ค่าเริ่ม 50) — ชิ้นที่ match ถึงเกณฑ์ไม่ขึ้นส้ม/แดง
-      - แสดงกรอบ OK (เขียว) ในช่องผลตรวจอัตโนมัติ, ไม่มีกรอบม่วง
-v1.4: Test จาก PDF มาร์คเต็มก้อน / เตือน layout ต่าง / ล้างผลเก่าเมื่อเปลี่ยน Test
-v1.3: เรียก sharp_fix.py อัตโนมัติ
+v1.6: แก้ ERR "align() takes 4 positional arguments but 5 were given" (ใช้ sharp_loose v2)
+      ERR -> แสดงสาเหตุเต็มในแถบสถานะ + ภาพ Test ในช่องผล (ไม่เป็นช่องดำ)
+      ชื่อหน้าต่างบอกเวอร์ชันตัวตรวจจริง (เช็คได้ว่า Pi ใช้ไฟล์ใหม่)
+v1.5: ไม่มีถ่ายใหม่ / ✂ ครอบรูป Test (+จำกรอบ) / match ขั้นต่ำ % / กรอบ OK อัตโนมัติ / ไม่มีม่วง
 """
 import os
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import ttk
 import cv2
 import mark_ui
 import sharp_check as SC
 try:
-    import sharp_fix  # noqa: F401  v1.3 แพตช์ (กรอบเส้นประ / ส้มผิด / Test จาก PDF)
-    SHARP_VER = "v1.5"
+    import sharp_fix  # noqa: F401
 except Exception as _ex:
     print("sharp_fix:", _ex)
-    SHARP_VER = "v1.2"
-try:
-    import sharp_loose  # noqa: F401  v1.5 ไม่มีถ่ายใหม่ / spec หลวม / %match / กรอบ OK
-except Exception as _ex:
-    print("sharp_loose:", _ex)
+import sharp_loose  # noqa: F401  v2 (ต้องมี)
 try:
     from mark_ui_kiosk import KioskApp as Base, maximize
 except Exception:
@@ -39,7 +33,7 @@ except Exception:
     except Exception:
         from mark_ui import App as Base
 
-ORANGE = "#ef8a00"
+SHARP_VER = "v1.6"
 IDLE_GREY = "#9aa5b1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -53,9 +47,8 @@ def open_camera_hi(index, backend_id=None, width=1920, height=1080):
         pass
     backs = [backend_id] if backend_id is not None else (
         [cv2.CAP_DSHOW, cv2.CAP_MSMF] if sys.platform == "win32" else [cv2.CAP_V4L2])
-    sizes = [(2560, 1440), (1920, 1080), (1600, 1200), (1280, 960), (1280, 720)]
     for bid in backs:
-        for (w, h) in sizes:
+        for (w, h) in [(2560, 1440), (1920, 1080), (1280, 720)]:
             cap = cv2.VideoCapture(index, bid)
             if not cap.isOpened():
                 cap.release()
@@ -80,7 +73,7 @@ if not hasattr(mark_ui, "_orig_open_camera"):
     mark_ui.open_camera = open_camera_hi
 
 
-def mark_ui_plus_safe(name):
+def safe_model(name):
     try:
         from mark_ui_plus import safe_model_name
         return safe_model_name(name)
@@ -89,7 +82,6 @@ def mark_ui_plus_safe(name):
 
 
 def apply_crop(img, box):
-    """box = [x0,y0,x1,y1] สัดส่วน 0-1"""
     if img is None or not box:
         return img
     h, w = img.shape[:2]
@@ -108,19 +100,19 @@ class CropDialog(tk.Toplevel):
         self.title("ครอบรูป Test — ลากกรอบครอบเฉพาะมาร์ค")
         sw, sh = app.winfo_screenwidth(), app.winfo_screenheight()
         self.geometry(f"{int(sw * 0.8)}x{int(sh * 0.8)}+{int(sw * 0.1)}+{int(sh * 0.05)}")
-        self.img, self.on_done, self.box = img, on_done, None
+        self.img, self.on_done, self.box, self.s = img, on_done, None, 1.0
         self.keep = tk.BooleanVar(value=keep)
-        bar = tk.Frame(self, bg=mark_ui.CARD)
+        bar = tk.Frame(self)
         bar.pack(fill="x")
         ttk.Button(bar, text="✔ ใช้กรอบ + ตรวจ", command=lambda: self._done(True)).pack(side="left", padx=4, pady=4)
         ttk.Button(bar, text="ใช้กรอบ", command=lambda: self._done(False)).pack(side="left", padx=4)
         ttk.Button(bar, text="ล้างกรอบ", command=self._clear).pack(side="left", padx=4)
         ttk.Checkbutton(bar, text="จำกรอบ ใช้กับภาพกล้องถัดไปอัตโนมัติ", variable=self.keep).pack(side="left", padx=10)
         ttk.Button(bar, text="ยกเลิก", command=self.destroy).pack(side="right", padx=4)
-        self.cv = tk.Canvas(self, bg=mark_ui.DARK, cursor="cross", highlightthickness=0)
+        self.cv = tk.Canvas(self, bg="#1f2a36", cursor="cross", highlightthickness=0)
         self.cv.pack(fill="both", expand=True)
         self.cv.bind("<Configure>", lambda e: self._draw())
-        self.cv.bind("<ButtonPress-1>", self._down)
+        self.cv.bind("<ButtonPress-1>", lambda e: setattr(self, "p0", (e.x, e.y)))
         self.cv.bind("<B1-Motion>", self._move)
         self.cv.bind("<ButtonRelease-1>", self._up)
         self.p0 = None
@@ -134,12 +126,9 @@ class CropDialog(tk.Toplevel):
             self.cv.create_image(0, 0, anchor="nw", image=self._ph)
         if self.box:
             h, w = self.img.shape[:2]
-            x0, y0, x1, y1 = (self.box[0] * w * self.s, self.box[1] * h * self.s,
-                              self.box[2] * w * self.s, self.box[3] * h * self.s)
-            self.cv.create_rectangle(x0, y0, x1, y1, outline="#ffd60a", width=4)
-
-    def _down(self, e):
-        self.p0 = (e.x, e.y)
+            self.cv.create_rectangle(self.box[0] * w * self.s, self.box[1] * h * self.s,
+                                     self.box[2] * w * self.s, self.box[3] * h * self.s,
+                                     outline="#ffd60a", width=4)
 
     def _move(self, e):
         if self.p0:
@@ -176,15 +165,17 @@ class SharpApp(Base):
         self._crop_keep = None
         self._crop_src_shape = None
         super().__init__()
-        self.title(mark_ui.APP + f"  (+ ตัวตรวจคมชัด {SHARP_VER})")
+        self.title(mark_ui.APP + f"  (+ ตัวตรวจคมชัด {SHARP_VER} / {getattr(SC, 'LOOSE_VERSION', '?')})")
         cfg = SC.load_config()
         self.use_sharp = tk.BooleanVar(value=True)
-        self.cont_blur = tk.BooleanVar(value=True)          # v1.5: ตรวจต่อเสมอ (ไม่มีถ่ายใหม่)
         self.match_pct = tk.IntVar(value=int(round(100 * float(cfg.get("match_min", 0.5)))))
         self._crop_keep = cfg.get("test_crop")
+        for name, val in (("show_ok", True),):
+            v = self.__dict__.get(name)
+            if isinstance(v, tk.Variable):
+                v.set(val)
         try:
-            self.show_ok.set(True)                          # v1.5: กรอบ OK อัตโนมัติ
-            self.p["check_extra"].set(False)                # ไม่วาดกรอบม่วง
+            self.p["check_extra"].set(False)
         except Exception:
             pass
         bar = tk.Frame(self, bg=mark_ui.CARD)
@@ -203,7 +194,7 @@ class SharpApp(Base):
             bar.pack(fill="x", padx=6)
         self._crop_label()
 
-    # ---------------------------------------------------------- ค่า match / ครอบรูป
+    # ---------------------------------------------------------- match / ครอบรูป
     def _save_match(self):
         try:
             v = max(0, min(100, int(self.match_pct.get())))
@@ -248,7 +239,6 @@ class SharpApp(Base):
         CropDialog(self, img, done, keep=bool(self._crop_keep))
 
     def _auto_crop(self, test):
-        """จำกรอบไว้ -> ครอบเฉพาะภาพเต็มจากกล้อง (ภาพที่ครอบแล้ว ขนาดไม่เท่า -> ไม่ครอบซ้ำ)"""
         if not self._crop_keep or test is None:
             return test
         src = self._crop_src_shape
@@ -256,7 +246,7 @@ class SharpApp(Base):
             lf = self.__dict__.get("live_frame")
             src = lf.shape[:2] if lf is not None else None
         if src is not None and tuple(test.shape[:2]) != tuple(src):
-            return test
+            return test                         # ภาพที่ครอบแล้ว -> ไม่ครอบซ้ำ
         return apply_crop(test, self._crop_keep)
 
     def open_cfg(self):
@@ -287,32 +277,13 @@ class SharpApp(Base):
         except Exception:
             pass
 
-    # ---------------------------------------------------------- ล้างผลเก่าเมื่อเปลี่ยน Test
     def _clear_result(self, img=None):
         try:
             self._big("—", IDLE_GREY)
         except Exception:
             pass
-        if hasattr(self, "_show_verdict"):
-            try:
-                self._show_verdict("")
-            except Exception:
-                pass
-        pn = self.__dict__.get("pn_result")
-        if pn is not None:
-            try:
-                pn.config(highlightbackground=IDLE_GREY, highlightcolor=IDLE_GREY, highlightthickness=8)
-            except Exception:
-                pass
         if img is not None:
             self._show_result_img(img, "ผลตรวจ : ยังไม่ได้ตรวจ — กด ▶ ตรวจสอบ")
-        for name in ("verdict", "verdict_lbl", "lbl_verdict"):
-            w = self.__dict__.get(name)
-            if isinstance(w, tk.Label):
-                try:
-                    w.config(text="—", bg=IDLE_GREY)
-                except Exception:
-                    pass
 
     def _show_test(self, img, path, title):
         super()._show_test(img, path, title)
@@ -321,14 +292,12 @@ class SharpApp(Base):
     def test_from_pdf(self, path=None):
         from tkinter import filedialog, messagebox
         if self.master_img is None:
-            messagebox.showwarning(mark_ui.APP, "เลือก Master ก่อน (ภาพมาร์คที่อ่านได้ปกติ)\n"
-                                   "โปรแกรมใช้ Master เป็นแบบในการหามาร์คใน PDF")
+            messagebox.showwarning(mark_ui.APP, "เลือก Master ก่อน")
             return
-        p = path or filedialog.askopenfilename(title="เลือก PDF (Order screen) สำหรับ Test",
-                                               filetypes=[("PDF", "*.pdf")])
+        p = path or filedialog.askopenfilename(title="เลือก PDF สำหรับ Test", filetypes=[("PDF", "*.pdf")])
         if not p:
             return
-        self.status.set("กำลังหามาร์คใน PDF (zoom / mirror / หมุน อัตโนมัติ) … บน Pi อาจใช้ 1-2 นาที")
+        self.status.set("กำลังหามาร์คใน PDF … บน Pi อาจใช้ 1-2 นาที")
         self._big("…", IDLE_GREY)
         self.update_idletasks()
         try:
@@ -337,18 +306,12 @@ class SharpApp(Base):
         except Exception as ex:
             self._clear_result()
             messagebox.showerror(mark_ui.APP, f"หามาร์คใน PDF ไม่สำเร็จ:\n{ex}")
-            self.status.set("หามาร์คใน PDF ไม่สำเร็จ")
             return
         self._show_test(r["test"], p, "Test (จาก PDF — มาร์คเต็ม ปรับทิศแล้ว)")
-        msg = (f"พบมาร์คใน PDF: กลับด้าน={'ใช่' if r['mirrored'] else 'ไม่'}  หมุน {r['angle']}°  "
-               f"จุดอ้างอิง {r['inliers']} ({r.get('quality', '')})")
+        msg = f"พบมาร์คใน PDF: กลับด้าน={'ใช่' if r['mirrored'] else 'ไม่'}  หมุน {r['angle']}°  จุดอ้างอิง {r['inliers']}"
         if r.get("layout_note"):
             msg += "  |  " + r["layout_note"]
         self.status.set(msg + "  — กด ▶ ตรวจสอบ")
-        if r.get("layout_diff"):
-            messagebox.showwarning(mark_ui.APP, r["layout_note"].replace(" | ", "\n").replace(" — ", "\n") +
-                                   "\n\nดูภาพ Test เทียบกับ Master ก่อนกดตรวจสอบ\n"
-                                   "(ส่วนที่อยู่นอกกรอบ Master เช่น QR / เลขพาร์ท จะไม่ถูกตรวจ)")
 
     # ---------------------------------------------------------- กล้อง / ตรวจ
     def cam_grab(self):
@@ -357,18 +320,18 @@ class SharpApp(Base):
             return super().cam_grab()
         cfg = SC.load_config()
         frames = []
-        for _ in range(max(1, int(cfg["multi_frames"]))):
+        for _ in range(max(1, int(cfg.get("multi_frames", 5)))):
             ok, f = cap.read()
             if ok and f is not None:
                 frames.append(f)
-        img, scores = SC.best_frame(frames, cfg["frame_mode"])
+        img, scores = SC.best_frame(frames, cfg.get("frame_mode", "best"))
         if img is None:
             return super().cam_grab()
         if self._crop_keep:
             self._crop_src_shape = img.shape[:2]
         self.test_img = img
         self.test_path.set(f"<จากกล้อง {len(frames)} เฟรม>")
-        self._grab_note = f"เลือกเฟรมคมสุด {max(scores):.0f} จาก {len(frames)} เฟรม ({cfg['frame_mode']})"
+        self._grab_note = f"เลือกเฟรมคมสุด {max(scores):.0f} จาก {len(frames)} เฟรม"
         self.run_inspect(self.test_img)
 
     def run_inspect(self, frame=None):
@@ -387,9 +350,9 @@ class SharpApp(Base):
         master = self.master_img.copy()
         ign = list(getattr(self, "ignores", []) or [])
         model = self.__dict__.get("model")
-        mname = mark_ui_plus_safe(model.get() if model is not None else "")
+        mname = safe_model(model.get() if model is not None else "")
         dbg = os.path.join(BASE_DIR, "results", mname, time.strftime("%Y%m%d"),
-                           time.strftime("%H%M%S") + "_debug") if cfg["debug_save"] else None
+                           time.strftime("%H%M%S") + "_debug") if cfg.get("debug_save") else None
         self.busy = True
         self._big("…", IDLE_GREY)
         self.status.set("ตัวตรวจคมชัด กำลังตรวจ …")
@@ -403,17 +366,20 @@ class SharpApp(Base):
                 r = SC.inspect(master, test, cfg, ign, dbg, True)
                 self.after(0, lambda rr=r: self._sharp_done(rr))
             except Exception as ex:
-                self.after(0, lambda e=ex: self._sharp_err(e))
+                traceback.print_exc()
+                self.after(0, lambda e=ex, t=test: self._sharp_err(e, t))
         threading.Thread(target=work, daemon=True).start()
 
-    def _sharp_err(self, ex):
+    def _sharp_err(self, ex, test=None):
         self.busy = False
         self._big("ERR", "#cc2b2b")
-        self.status.set(f"ตัวตรวจคมชัดผิดพลาด: {ex} — ปิดติ๊ก 'ใช้ตัวตรวจคมชัด' เพื่อใช้ตัวตรวจเดิม")
+        if test is not None:
+            self._show_result_img(test, f"ผลตรวจ : ERR — {ex}")
+        self.status.set(f"ตัวตรวจคมชัดผิดพลาด: {type(ex).__name__}: {ex} — ปิดติ๊ก 'ใช้ตัวตรวจคมชัด' เพื่อใช้ตัวตรวจเดิม")
 
     def _sharp_done(self, r):
         self.busy = False
-        notes = list(r["notes"])
+        notes = list(r.get("notes", []))
         for n in (getattr(self, "_crop_note", ""), getattr(self, "_grab_note", "")):
             if n:
                 notes.insert(0, n)
@@ -421,7 +387,11 @@ class SharpApp(Base):
         if r.get("debug_dir"):
             notes.append("debug: " + os.path.relpath(r["debug_dir"], BASE_DIR))
         self._pre_msgs = [f"ตัวตรวจคมชัด {SHARP_VER}"] + notes
-        super()._on_result((r["report"], r["overlay"], r["aligned"]))
+        try:
+            super()._on_result((r["report"], r["overlay"], r["aligned"]))
+        except Exception as ex:
+            traceback.print_exc()
+            self._sharp_err(ex, r.get("overlay"))
 
 
 def main():
