@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-web_sharp.py v1.5 — เว็บตรวจมาร์ค (มือถือ / iPad) + ตัวตรวจคมชัด (sharp_check.py)
+web_sharp.py v1.6 — เว็บตรวจมาร์ค (มือถือ / iPad) + ตัวตรวจคมชัด (sharp_check.py)
 ไม่แก้ไฟล์เดิม: ใช้หน้าเว็บ/ฟังก์ชันของ web_app.py
+v1.6: เพิ่ม sharp_guard (SNI ขีดล่างหาย / ขาตัวอักษรหาย ต้องเจอ + กรอบตรงตำแหน่ง)
 v1.5: แก้ "align() takes 4 positional arguments but 5 were given" (ใช้ sharp_loose v2)
       ตรวจพลาด -> แสดงข้อความ error พร้อมเหตุผล (ไม่ทิ้งหน้าเปล่า)
 v1.4: ไม่มีถ่ายใหม่ / spec หลวม / ไม่มีม่วง / กรอบ OK / match ขั้นต่ำ % / ครอบรูป Test บนเว็บ
@@ -18,7 +19,8 @@ try:
     import sharp_fix  # noqa: F401
 except Exception as _ex:
     print("sharp_fix:", _ex)
-import sharp_loose  # noqa: F401  v2 (ต้องมี)
+import sharp_loose  # noqa: F401  loose v3 (ลดส้ม/แดง — ไม่แก้)
+import sharp_guard  # noqa: F401  guard v1 (จับเส้น/ขีดหายจริง + กรอบตรงตำแหน่ง)
 
 CROP_JS = r"""
 <script>
@@ -62,7 +64,7 @@ def extra_html():
             'ใช้ตัวตรวจคมชัด</label>'
             f'<label>match ขั้นต่ำ % <input type="number" name="match_min" value="{mm}" min="0" max="100" step="5" '
             'style="font-size:20px;width:90px"></label>'
-            '<div class="small">ชิ้นที่ match ถึงเกณฑ์ไม่ขึ้นส้ม/แดง — ลด = alarm น้อยลง (แนะนำ 50–65)</div></div>')
+            '<div class="small">ชิ้นที่ match ถึงเกณฑ์ไม่ขึ้นส้ม/แดง — ลด = alarm น้อยลง (แนะนำ 40–60)</div></div>')
 
 
 def page_form(model="", note=""):
@@ -196,7 +198,7 @@ class Handler(W.Handler):
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print(f"โปรแกรมตรวจมาร์ค (เว็บ + ตัวตรวจคมชัด v1.5, {SC.VERSION}) พร้อมแล้ว:")
+    print(f"โปรแกรมตรวจมาร์ค (เว็บ + ตัวตรวจคมชัด v1.6, {SC.VERSION}) พร้อมแล้ว:")
     for ip in W.local_ips():
         print(f"   http://{ip}:{port}")
     try:

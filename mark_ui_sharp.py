@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mark_ui_sharp.py v1.6 — โปรแกรมตรวจมาร์ค + "ตัวตรวจคมชัด" (sharp_check.py)
+mark_ui_sharp.py v1.7 — โปรแกรมตรวจมาร์ค + "ตัวตรวจคมชัด" (sharp_check.py)
 ไม่แก้ไฟล์เดิม: ต่อยอดจาก mark_ui_kiosk -> mark_ui_plus -> mark_ui
+v1.7: เพิ่ม sharp_guard (SNI ขีดล่างหาย / ขาตัวอักษรหาย ต้องเจอ + กรอบเขียวตรงตัวอักษร)
+      ไม่แก้ sharp_loose v3
 v1.6: แก้ ERR "align() takes 4 positional arguments but 5 were given" (ใช้ sharp_loose v2)
       ERR -> แสดงสาเหตุเต็มในแถบสถานะ + ภาพ Test ในช่องผล (ไม่เป็นช่องดำ)
       ชื่อหน้าต่างบอกเวอร์ชันตัวตรวจจริง (เช็คได้ว่า Pi ใช้ไฟล์ใหม่)
@@ -23,7 +25,8 @@ try:
     import sharp_fix  # noqa: F401
 except Exception as _ex:
     print("sharp_fix:", _ex)
-import sharp_loose  # noqa: F401  v2 (ต้องมี)
+import sharp_loose  # noqa: F401  loose v3 (ลดส้ม/แดง — ไม่แก้)
+import sharp_guard  # noqa: F401  guard v1 (จับเส้น/ขีดหายจริง + กรอบตรงตำแหน่ง)
 try:
     from mark_ui_kiosk import KioskApp as Base, maximize
 except Exception:
@@ -33,7 +36,7 @@ except Exception:
     except Exception:
         from mark_ui import App as Base
 
-SHARP_VER = "v1.6"
+SHARP_VER = "v1.7"
 IDLE_GREY = "#9aa5b1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -165,7 +168,7 @@ class SharpApp(Base):
         self._crop_keep = None
         self._crop_src_shape = None
         super().__init__()
-        self.title(mark_ui.APP + f"  (+ ตัวตรวจคมชัด {SHARP_VER} / {getattr(SC, 'LOOSE_VERSION', '?')})")
+        self.title(mark_ui.APP + f"  (+ ตัวตรวจคมชัด {SHARP_VER} / {getattr(SC, 'LOOSE_VERSION', '?')} / {getattr(SC, 'GUARD_VERSION', '?')})")
         cfg = SC.load_config()
         self.use_sharp = tk.BooleanVar(value=True)
         self.match_pct = tk.IntVar(value=int(round(100 * float(cfg.get("match_min", 0.5)))))
