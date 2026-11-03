@@ -3,15 +3,21 @@
 """glyph_check.py — ตรวจ "องค์ประกอบจางขาดหาย" แบบอัตโนมัติ
 v8: แก้เส้นที่หายถูกข้ามเป็น "ภาพเบลอ"
 v9: แก้ "ขีดของตัวอักษรหาย แต่ไม่เจอ" (เช่น ขาตั้งของตัว L ใน TEMPERLITE)
-    สาเหตุ: ตอนเลื่อนหาตำแหน่งรายตัวอักษร (local search) ตัวอักษรไป "ยืมหมึก" ของตัวข้างเคียง
-            (ขาตั้งของ L ที่หาย ไปทับปลายแขนของตัว E ที่อยู่ติดกัน) -> วัดได้ว่าหายแค่ 5%
-    แก้:   แต่ละตัวอักษรใช้หมึกได้เฉพาะ "เขตของตัวเอง" (พื้นที่ที่ใกล้ตัวนั้นที่สุด)
-            หมึกของตัวข้างเคียงไม่ถูกนำมานับแทน"""
+    แต่ละตัวอักษรใช้หมึกได้เฉพาะ "เขตของตัวเอง"
+v10: แก้ false alarm สีส้ม/แดง/ม่วง เมื่อถ่ายชิ้นงานเดียวกัน (แสง เงา ความคม กล้อง ต่างกัน)
+    สาเหตุ: ตัดสินจาก "หน้ากากหมึก (binary)" อย่างเดียว -> เส้นบาง (6, 0, 8, เส้นประมุม)
+            ขาดหายบางส่วนตอน threshold ทั้งที่ตัวอักษรอยู่ครบ
+    แก้:   ชิ้นที่ judge ได้ PARTIAL/MISSING -> "ยืนยันซ้ำด้วยภาพเทา" (verify_gray)
+            ลบพื้นหลัง/เงา + เบลอให้คมเท่ากัน + หาตำแหน่งรอบ ๆ + ลองหมึกเข้ม/สว่าง
+            ผ่านถ้า รูปร่างเหมือน (NCC >= v_ncc) และ หมึก Master เจอใน Test (>= v_cover)
+            ตัวที่หายจริง -> NCC/cover ต่ำ -> ยังเป็น NG
+          + เศษเส้นตรงเล็ก (LINE) ที่ขอบกรอบมาร์ค (มุมเส้นประ) -> SKIP
+          + หมึกเกิน (สีม่วง) ไม่ใช้ตัดสินและไม่วาด (check_extra=False)
+"""
 import argparse, json, os
 from datetime import datetime
 import numpy as np
 import cv2
-
 from mark_match import to_ink_mask, align
 
 
@@ -104,11 +110,7 @@ def mark_dash_groups(els, img_w, img_h, min_count=4, gap_cv_max=0.6,
 
 
 def element_zones(mmask, els):
-    """
-    v9: แบ่งภาพเป็น "เขต" ของแต่ละชิ้นส่วน = พิกเซลที่อยู่ใกล้ชิ้นนั้นมากกว่าชิ้นอื่น
-    คืน (zone_label_map, {element_id: label})
-    """
-    src = np.where(mmask > 0, 0, 255).astype(np.uint8)          # หมึก = 0
+    src = np.where(mmask > 0, 0, 255).astype(np.uint8)
     _, zl = cv2.distanceTransformWithLabels(src, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_CCOMP)
     lab_of = {}
     for e in els:
@@ -122,8 +124,6 @@ def extent_fractions(el, test_mask, tol_px=2, loss_density=0.60, local_search=0,
                      zone_map=None, zone_label=None):
     x, y, w, h = el["x"], el["y"], el["w"], el["h"]
     if zone_map is not None and zone_label is not None:
-        # v9: ใช้เฉพาะหมึกใน "เขตของตัวเอง" — ไม่ยืมหมึกของตัวข้างเคียง
-        #     ขยายเขตออกเล็กน้อย (~1/4 ความหนาเส้น) เผื่อภาพถ่ายเลื่อน/เส้นหนากว่า Master
         Hz, Wz = zone_map.shape
         g = max(2, int(round(0.25 * float(el.get("stroke", 4.0)))))
         p = g + 30
@@ -230,6 +230,60 @@ def is_blurred(el, master_bgr, aligned_bgr, baseline, bg_std, blur_rel_thr=0.35,
     return ink_ratio >= ink_thr, rel, ink_ratio
 
 
+# ------------------------------------------------------------------ v10: ยืนยันด้วยภาพเทา
+def _flat(g, k):
+    """ลบพื้นหลัง/เงา -> 0..1 (หมึกเข้ม = ค่าต่ำ)"""
+    g = g.astype(np.float32) + 1.0
+    f = g / cv2.GaussianBlur(g, (0, 0), k)
+    lo, hi = np.percentile(f, 2), np.percentile(f, 98)
+    return np.clip((f - lo) / max(hi - lo, 1e-3), 0, 1)
+
+
+def _otsu_ink(p):
+    _, b = cv2.threshold((p * 255).astype(np.uint8), 0, 1, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return b
+
+
+def verify_gray(el, g_m, g_t, search=0.45):
+    """คืน (ncc, cover) — ncc = รูปร่างเหมือน, cover = หมึก Master ที่เจอใน Test"""
+    H, W = g_m.shape
+    x, y, w, h = el["x"], el["y"], el["w"], el["h"]
+    sz = max(w, h)
+    pad = max(4, int(0.25 * sz))
+    sr = max(4, int(search * sz))
+    x0, y0, x1, y1 = max(0, x - pad), max(0, y - pad), min(W, x + w + pad), min(H, y + h + pad)
+    X0, Y0, X1, Y1 = max(0, x0 - sr), max(0, y0 - sr), min(W, x1 + sr), min(H, y1 + sr)
+    k = max(3.0, sz * 0.9)
+    mw, tw = _flat(g_m[Y0:Y1, X0:X1], k), _flat(g_t[Y0:Y1, X0:X1], k)
+    tpl = mw[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0]
+    m_ink = _otsu_ink(tpl)
+    if m_ink.sum() < 6 or tpl.std() < 0.03:
+        return 1.0, 1.0
+    s = max(0.6, sz * 0.03)
+    tpl_b = cv2.GaussianBlur(tpl, (0, 0), s)
+    best = (-1.0, None, None)
+    for inv in (False, True):                         # หมึกเข้ม / หมึกสว่าง (กระจกเขียว)
+        t = 1.0 - tw if inv else tw
+        r = cv2.matchTemplate(cv2.GaussianBlur(t, (0, 0), s), tpl_b, cv2.TM_CCOEFF_NORMED)
+        _, mx, _, loc = cv2.minMaxLoc(r)
+        if mx > best[0]:
+            best = (mx, loc, t)
+    ncc, loc, t = best
+    th, tw_ = tpl.shape
+    t_ink = _otsu_ink(t[loc[1]:loc[1] + th, loc[0]:loc[0] + tw_])
+    tol = max(1, int(round(sz * 0.06)))
+    t_ink = cv2.dilate(t_ink, np.ones((2 * tol + 1,) * 2, np.uint8))
+    return float(ncc), float((t_ink[m_ink > 0] > 0).mean())
+
+
+def _frame_edge(el, bbox, frac=0.06):
+    """ชิ้นอยู่ที่ขอบกรอบรวมของมาร์ค (เช่น มุมเส้นประ)"""
+    bx0, by0, bx1, by1 = bbox
+    mx, my = frac * (bx1 - bx0), frac * (by1 - by0)
+    return (el["x"] <= bx0 + mx or el["x"] + el["w"] >= bx1 - mx or
+            el["y"] <= by0 + my or el["y"] + el["h"] >= by1 - my)
+
+
 def judge(cov, vfrac, hfrac, p):
     loss = 1.0 - cov
     if vfrac < p["min_extent"] or hfrac < p["min_extent"] or loss < p["min_loss"]:
@@ -263,8 +317,13 @@ DEFAULT_P = dict(
     check_dash=True, dash_edge_ratio=0.07, dash_min_count=4,
     dash_gap_cv_max=0.6, dash_area_percentile=70,
     min_area=40, merge_gap=0, tol_px=2,
-    check_extra=True, extra_area=120,
-    own_zone=True,   # v9: ตัวอักษรใช้หมึกได้เฉพาะเขตของตัวเอง (False = แบบ v8)
+    check_extra=False, extra_area=120,      # v10: หมึกเกิน (สีม่วง) ปิด
+    own_zone=True,
+    verify=True,        # v10: ยืนยันชิ้น NG ด้วยภาพเทา
+    v_ncc=0.55,         # v10: รูปร่างเหมือนขั้นต่ำ   (ลด = alarm น้อยลง)
+    v_cover=0.70,       # v10: หมึก Master เจอใน Test ขั้นต่ำ (ลด = alarm น้อยลง, ห้าม < 0.60)
+    v_search=0.45,      # v10: ค้นหาตำแหน่งรอบชิ้น ± สัดส่วนขนาดชิ้น
+    skip_frame_line=True,  # v10: เศษเส้นตรงที่ขอบกรอบมาร์ค (มุมเส้นประ) -> SKIP
 )
 
 
@@ -281,7 +340,11 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
     base = sharpness_baseline(els, master_bgr, aligned) if p["check_blur"] else 1.0
     zmap, zlab = element_zones(mmask, els) if p["own_zone"] else (None, {})
     bg_std = background_noise_std(cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY))
-    rows, ng, n_blur, n_dash = [], 0, 0, 0
+    g_m = cv2.cvtColor(master_bgr, cv2.COLOR_BGR2GRAY)
+    g_t = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
+    bbox = (min(e["x"] for e in els), min(e["y"] for e in els),
+            max(e["x"] + e["w"] for e in els), max(e["y"] + e["h"] for e in els)) if els else (0, 0, 1, 1)
+    rows, ng, n_blur, n_dash, n_ver = [], 0, 0, 0, 0
     for el in els:
         cov = vfrac = hfrac = None
         off = (0, 0)
@@ -293,6 +356,8 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
             status, note = "SKIP", f"อยู่ในโซน {z}"
         elif outside:
             status, note = "SKIP", "อยู่นอกภาพถ่าย — ไม่ตรวจ"
+        elif p["skip_frame_line"] and el["kind"] == "LINE" and _frame_edge(el, bbox):
+            status, note = "SKIP", "เส้นกรอบ/มุมเส้นประ — ไม่ตรวจ"; n_dash += 1
         else:
             blur, rel, con = (False, 1, 1)
             if p["check_blur"]:
@@ -305,6 +370,13 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
                     el, tmask, p["tol_px"], p["row_loss_thr"], float(p["local_search"]), p["stroke_tol"],
                     zmap, zlab.get(el["id"]))
                 status, note = judge(cov, vfrac, hfrac, p)
+                if status != "OK" and p["verify"]:
+                    ncc, vc = verify_gray(el, g_m, g_t, p["v_search"])
+                    if ncc >= p["v_ncc"] and vc >= p["v_cover"]:
+                        status = "OK"; n_ver += 1
+                        note = f"ภาพเทายืนยันครบ (ncc {ncc:.2f}, cover {vc:.0%}) | เดิม: {note}"
+                    else:
+                        note = f"{note} | ncc {ncc:.2f} cover {vc:.0%}"
                 ng += status != "OK"
         rows.append(dict(id=el["id"], kind=el["kind"], status=status, note=note,
                          x=el["x"], y=el["y"], w=el["w"], h=el["h"], area=el["area"],
@@ -321,13 +393,14 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
         extras = [dict(x=int(st[i, 0]), y=int(st[i, 1]), w=int(st[i, 2]), h=int(st[i, 3]),
                        area=int(st[i, 4])) for i in range(1, n) if st[i, 4] >= p["extra_area"]]
     rep = dict(timestamp=datetime.now().isoformat(timespec="seconds"),
-               verdict="NG" if ng else "OK", align_method=method, align_inliers=inl,
+               verdict="NG" if ng else "OK", align_method=f"{method} | v10 ยืนยัน {n_ver}",
+               align_inliers=inl,
                n_elements=len(els),
                n_ok=sum(r["status"] == "OK" for r in rows),
                n_missing=sum(r["status"] == "MISSING" for r in rows),
                n_partial=sum(r["status"] == "PARTIAL" for r in rows),
                n_skip=sum(r["status"] == "SKIP" for r in rows),
-               n_blur=n_blur, n_dash=n_dash, n_extra=len(extras),
+               n_blur=n_blur, n_dash=n_dash, n_extra=len(extras), n_verified=n_ver,
                elements=rows, extras=extras, params=p)
     return rep, draw(master_bgr, aligned, rows, extras, zones), aligned, mmask, tmask, els
 
@@ -383,7 +456,7 @@ def main():
     json.dump(rep, open(os.path.join(a.out, "report.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
     print(f'RESULT = {rep["verdict"]}  align={rep["align_method"]}  ชิ้น={rep["n_elements"]} '
           f'MISSING={rep["n_missing"]} PARTIAL={rep["n_partial"]} SKIP={rep["n_skip"]} '
-          f'(blur={rep["n_blur"]} dash={rep["n_dash"]})')
+          f'(blur={rep["n_blur"]} dash={rep["n_dash"]} ยืนยันด้วยภาพเทา={rep["n_verified"]})')
     for r in rep["elements"]:
         if r["status"] != "OK":
             print(f'  [{r["status"]}] #{r["id"]} {r["kind"]} ({r["x"]},{r["y"]}) {r["w"]}x{r["h"]} {r["note"]}')
