@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """glyph_check.py — ตรวจ "องค์ประกอบจางขาดหาย" แบบอัตโนมัติ
-v8: แก้เส้นที่หายถูกข้ามเป็น "ภาพเบลอ"
-v9: แก้ "ขีดของตัวอักษรหาย แต่ไม่เจอ" (เช่น ขาตั้งของตัว L ใน TEMPERLITE)
-    แต่ละตัวอักษรใช้หมึกได้เฉพาะ "เขตของตัวเอง"
-v10: แก้ false alarm สีส้ม/แดง/ม่วง เมื่อถ่ายชิ้นงานเดียวกัน (แสง เงา ความคม กล้อง ต่างกัน)
-    สาเหตุ: ตัดสินจาก "หน้ากากหมึก (binary)" อย่างเดียว -> เส้นบาง (6, 0, 8, เส้นประมุม)
-            ขาดหายบางส่วนตอน threshold ทั้งที่ตัวอักษรอยู่ครบ
-    แก้:   ชิ้นที่ judge ได้ PARTIAL/MISSING -> "ยืนยันซ้ำด้วยภาพเทา" (verify_gray)
-            ลบพื้นหลัง/เงา + เบลอให้คมเท่ากัน + หาตำแหน่งรอบ ๆ + ลองหมึกเข้ม/สว่าง
-            ผ่านถ้า รูปร่างเหมือน (NCC >= v_ncc) และ หมึก Master เจอใน Test (>= v_cover)
-            ตัวที่หายจริง -> NCC/cover ต่ำ -> ยังเป็น NG
-          + เศษเส้นตรงเล็ก (LINE) ที่ขอบกรอบมาร์ค (มุมเส้นประ) -> SKIP
-          + หมึกเกิน (สีม่วง) ไม่ใช้ตัดสินและไม่วาด (check_extra=False)
+v8 : แก้เส้นที่หายถูกข้ามเป็น "ภาพเบลอ"
+v9 : แต่ละตัวอักษรใช้หมึกได้เฉพาะ "เขตของตัวเอง"
+v10: ชิ้นที่ judge ได้ PARTIAL/MISSING -> ยืนยันซ้ำด้วยภาพเทา (verify_gray)
+     ลบพื้นหลัง/เงา + เบลอให้คมเท่ากัน + หาตำแหน่งรอบ ๆ + ลองหมึกเข้ม/สว่าง
+v11: ปลด spec ให้หลวมลง + FORCE (บังคับค่า) กัน UI / web / config เก่าส่งค่าเข้มมาทับ
+     - หมึกเกิน (ม่วง) ปิดถาวร ไม่คำนวณ ไม่วาด
+     - ยืนยันภาพเทา: ncc >= 0.45 และ cover >= 0.60
+     - หายต้องเกิน 15% และกว้าง/สูงเกิน 40% ของตัวถึงนับ, หายทั้งชิ้น = เหลือ < 15%
+     - ชิ้นเล็ก < 60 px ไม่ตรวจ, เผื่อตำแหน่ง 3 px
+     - ขีด/จุดเล็ก (เช่น "-") ที่ไม่ผ่าน -> ส้ม ไม่ใช่แดง
+     - พิมพ์ "[glyph_check] v11" ตอน import ใช้เช็คว่า Pi ใช้ไฟล์ใหม่จริง
 """
 import argparse, json, os
 from datetime import datetime
 import numpy as np
 import cv2
 from mark_match import to_ink_mask, align
+
+VERSION = "v11"
 
 
 def segment_elements(mask, min_area=40, merge_gap=0, dash_params=None):
@@ -232,7 +233,6 @@ def is_blurred(el, master_bgr, aligned_bgr, baseline, bg_std, blur_rel_thr=0.35,
 
 # ------------------------------------------------------------------ v10: ยืนยันด้วยภาพเทา
 def _flat(g, k):
-    """ลบพื้นหลัง/เงา -> 0..1 (หมึกเข้ม = ค่าต่ำ)"""
     g = g.astype(np.float32) + 1.0
     f = g / cv2.GaussianBlur(g, (0, 0), k)
     lo, hi = np.percentile(f, 2), np.percentile(f, 98)
@@ -262,7 +262,7 @@ def verify_gray(el, g_m, g_t, search=0.45):
     s = max(0.6, sz * 0.03)
     tpl_b = cv2.GaussianBlur(tpl, (0, 0), s)
     best = (-1.0, None, None)
-    for inv in (False, True):                         # หมึกเข้ม / หมึกสว่าง (กระจกเขียว)
+    for inv in (False, True):
         t = 1.0 - tw if inv else tw
         r = cv2.matchTemplate(cv2.GaussianBlur(t, (0, 0), s), tpl_b, cv2.TM_CCOEFF_NORMED)
         _, mx, _, loc = cv2.minMaxLoc(r)
@@ -277,7 +277,6 @@ def verify_gray(el, g_m, g_t, search=0.45):
 
 
 def _frame_edge(el, bbox, frac=0.06):
-    """ชิ้นอยู่ที่ขอบกรอบรวมของมาร์ค (เช่น มุมเส้นประ)"""
     bx0, by0, bx1, by1 = bbox
     mx, my = frac * (bx1 - bx0), frac * (by1 - by0)
     return (el["x"] <= bx0 + mx or el["x"] + el["w"] >= bx1 - mx or
@@ -303,32 +302,31 @@ def in_ignore(cx, cy, zones):
     return None
 
 
-def mask_out(mask, zones):
-    m = mask.copy()
-    for z in zones:
-        m[max(0, z["y"]):z["y"] + z["h"], max(0, z["x"]):z["x"] + z["w"]] = 0
-    return m
-
-
 DEFAULT_P = dict(
-    min_extent=0.30, min_loss=0.08, row_loss_thr=0.60, miss_full=0.25,
+    min_extent=0.40, min_loss=0.15, row_loss_thr=0.60, miss_full=0.15,
     local_search=0.35, stroke_tol=0.35,
     check_blur=True, blur_rel_thr=0.35, ink_thr=0.15,
     check_dash=True, dash_edge_ratio=0.07, dash_min_count=4,
     dash_gap_cv_max=0.6, dash_area_percentile=70,
-    min_area=40, merge_gap=0, tol_px=2,
-    check_extra=False, extra_area=120,      # v10: หมึกเกิน (สีม่วง) ปิด
+    min_area=60, merge_gap=0, tol_px=3,
+    check_extra=False, extra_area=120,
     own_zone=True,
-    verify=True,        # v10: ยืนยันชิ้น NG ด้วยภาพเทา
-    v_ncc=0.55,         # v10: รูปร่างเหมือนขั้นต่ำ   (ลด = alarm น้อยลง)
-    v_cover=0.70,       # v10: หมึก Master เจอใน Test ขั้นต่ำ (ลด = alarm น้อยลง, ห้าม < 0.60)
-    v_search=0.45,      # v10: ค้นหาตำแหน่งรอบชิ้น ± สัดส่วนขนาดชิ้น
-    skip_frame_line=True,  # v10: เศษเส้นตรงที่ขอบกรอบมาร์ค (มุมเส้นประ) -> SKIP
+    verify=True, v_ncc=0.45, v_cover=0.60, v_search=0.45,
+    skip_frame_line=True,
 )
+
+# v11: ค่าที่ "บังคับ" — ทับค่าที่ส่งมาจาก UI / web / config เก่าเสมอ
+#      อยากปรับความหลวม แก้ที่นี่ที่เดียว (ลด = alarm น้อยลง, v_cover ห้ามต่ำกว่า 0.55)
+FORCE = dict(check_extra=False, verify=True, skip_frame_line=True,
+             v_ncc=0.45, v_cover=0.60, min_extent=0.40, min_loss=0.15,
+             miss_full=0.15, min_area=60, tol_px=3)
+
+print(f"[glyph_check] {VERSION} โหลดแล้ว — spec หลวม, ไม่มีกรอบม่วง "
+      f"(ncc {FORCE['v_ncc']}, cover {FORCE['v_cover']})")
 
 
 def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
-    p = dict(DEFAULT_P); p.update(params or {})
+    p = dict(DEFAULT_P); p.update(params or {}); p.update(FORCE)
     zones = ignore_zones or []
     aligned, method, inl, valid = align(test_bgr, master_bgr, return_valid=True)
     mmask = to_ink_mask(master_bgr)
@@ -376,6 +374,8 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
                         status = "OK"; n_ver += 1
                         note = f"ภาพเทายืนยันครบ (ncc {ncc:.2f}, cover {vc:.0%}) | เดิม: {note}"
                     else:
+                        if status == "MISSING" and el["kind"] == "LINE":
+                            status = "PARTIAL"            # v11: ขีดเล็ก ("-") ไม่ขึ้นแดง
                         note = f"{note} | ncc {ncc:.2f} cover {vc:.0%}"
                 ng += status != "OK"
         rows.append(dict(id=el["id"], kind=el["kind"], status=status, note=note,
@@ -384,23 +384,16 @@ def inspect_glyph(master_bgr, test_bgr, ignore_zones=None, params=None):
                          cov=None if cov is None else round(cov, 3),
                          vfrac=None if vfrac is None else round(vfrac, 3),
                          hfrac=None if hfrac is None else round(hfrac, 3)))
-    extras = []
-    if p["check_extra"]:
-        tol = max(p["tol_px"], 6)
-        ex = cv2.subtract(mask_out(tmask, zones), cv2.dilate(mmask, np.ones((2 * tol + 3,) * 2, np.uint8)))
-        ex = cv2.morphologyEx(ex, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        n, _, st, _ = cv2.connectedComponentsWithStats(ex, 8)
-        extras = [dict(x=int(st[i, 0]), y=int(st[i, 1]), w=int(st[i, 2]), h=int(st[i, 3]),
-                       area=int(st[i, 4])) for i in range(1, n) if st[i, 4] >= p["extra_area"]]
+    extras = []                                          # v11: ไม่ตรวจหมึกเกิน
     rep = dict(timestamp=datetime.now().isoformat(timespec="seconds"),
-               verdict="NG" if ng else "OK", align_method=f"{method} | v10 ยืนยัน {n_ver}",
+               verdict="NG" if ng else "OK", align_method=f"{method} | {VERSION} ยืนยัน {n_ver}",
                align_inliers=inl,
                n_elements=len(els),
                n_ok=sum(r["status"] == "OK" for r in rows),
                n_missing=sum(r["status"] == "MISSING" for r in rows),
                n_partial=sum(r["status"] == "PARTIAL" for r in rows),
                n_skip=sum(r["status"] == "SKIP" for r in rows),
-               n_blur=n_blur, n_dash=n_dash, n_extra=len(extras), n_verified=n_ver,
+               n_blur=n_blur, n_dash=n_dash, n_extra=0, n_verified=n_ver,
                elements=rows, extras=extras, params=p)
     return rep, draw(master_bgr, aligned, rows, extras, zones), aligned, mmask, tmask, els
 
@@ -421,8 +414,7 @@ def draw_result(aligned, rows, extras, zones, show_ok=True):
         cv2.rectangle(R, (x - 2, y - 2), (x + r["w"] + 2, y + r["h"] + 2), c, 3 if bad else 1)
         if bad:
             cv2.putText(R, f'#{r["id"]}', (x, max(14, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2, cv2.LINE_AA)
-    for e in extras:
-        cv2.rectangle(R, (e["x"] - 2, e["y"] - 2), (e["x"] + e["w"] + 2, e["y"] + e["h"] + 2), (255, 0, 255), 2)
+    # v11: ไม่วาดกรอบม่วง (หมึกเกิน) ไม่ว่าผู้เรียกจะส่ง extras มาหรือไม่
     return R
 
 
@@ -442,23 +434,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--master", required=True); ap.add_argument("--test", required=True)
     ap.add_argument("--ignore"); ap.add_argument("--out", default="res_glyph")
-    ap.add_argument("--set", nargs="*", default=[])
     a = ap.parse_args()
     rd = lambda f: cv2.imdecode(np.fromfile(f, np.uint8), cv2.IMREAD_COLOR)
     zones = json.load(open(a.ignore, encoding="utf-8")).get("ignore", []) if a.ignore else []
-    params = {}
-    for kv in a.set:
-        k, v = kv.split("=")
-        params[k] = (v in ("1", "True", "true")) if isinstance(DEFAULT_P[k], bool) else type(DEFAULT_P[k])(float(v))
-    rep, ov, *_ = inspect_glyph(rd(a.master), rd(a.test), zones, params)
+    rep, ov, *_ = inspect_glyph(rd(a.master), rd(a.test), zones)
     os.makedirs(a.out, exist_ok=True)
     cv2.imencode(".png", ov)[1].tofile(os.path.join(a.out, "overlay.png"))
     json.dump(rep, open(os.path.join(a.out, "report.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
     print(f'RESULT = {rep["verdict"]}  align={rep["align_method"]}  ชิ้น={rep["n_elements"]} '
           f'MISSING={rep["n_missing"]} PARTIAL={rep["n_partial"]} SKIP={rep["n_skip"]} '
-          f'(blur={rep["n_blur"]} dash={rep["n_dash"]} ยืนยันด้วยภาพเทา={rep["n_verified"]})')
+          f'ยืนยันด้วยภาพเทา={rep["n_verified"]}')
     for r in rep["elements"]:
-        if r["status"] != "OK":
+        if r["status"] not in ("OK", "SKIP"):
             print(f'  [{r["status"]}] #{r["id"]} {r["kind"]} ({r["x"]},{r["y"]}) {r["w"]}x{r["h"]} {r["note"]}')
 
 
