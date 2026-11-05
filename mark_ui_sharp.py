@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mark_ui_sharp.py v1.7 — โปรแกรมตรวจมาร์ค + "ตัวตรวจคมชัด" (sharp_check.py)
+mark_ui_sharp.py v1.8 — โปรแกรมตรวจมาร์ค + "ตัวตรวจคมชัด" (sharp_check.py)
 ไม่แก้ไฟล์เดิม: ต่อยอดจาก mark_ui_kiosk -> mark_ui_plus -> mark_ui
+v1.8: ใช้ sharp_final (ตัวตัดสินสุดท้าย) — ชิ้นงานดีไม่ขึ้นส้ม/แดง, ขีด/เส้นหายจริงยังเจอ
+      ภาพผล = พื้นขาวสะอาด + ตัวดำ (ไม่มีลาย) วาดกรอบ OK/NG เอง
+      ครอบรูป Test: ช่องกล้องสดแสดงเฉพาะส่วนที่ครอบ, ภาพผลขยายเต็มช่อง (ไม่ใช่ภาพเล็ก)
+      ช่อง "NG เมื่อหาย ≥ %" แทน "match ขั้นต่ำ %" (ค่าเริ่ม 20)
 v1.7: เพิ่ม sharp_guard (SNI ขีดล่างหาย / ขาตัวอักษรหาย ต้องเจอ + กรอบเขียวตรงตัวอักษร)
       ไม่แก้ sharp_loose v3
 v1.6: แก้ ERR "align() takes 4 positional arguments but 5 were given" (ใช้ sharp_loose v2)
@@ -26,7 +30,8 @@ try:
 except Exception as _ex:
     print("sharp_fix:", _ex)
 import sharp_loose  # noqa: F401  loose v3 (ลดส้ม/แดง — ไม่แก้)
-import sharp_guard  # noqa: F401  guard v1 (จับเส้น/ขีดหายจริง + กรอบตรงตำแหน่ง)
+import sharp_guard  # noqa: F401  guard v1 (สำรอง)
+import sharp_final  # noqa: F401  final v1 (ตัวตัดสินสุดท้าย + จัดภาพเอง + ภาพผลพื้นขาว)
 try:
     from mark_ui_kiosk import KioskApp as Base, maximize
 except Exception:
@@ -36,7 +41,7 @@ except Exception:
     except Exception:
         from mark_ui import App as Base
 
-SHARP_VER = "v1.7"
+SHARP_VER = "v1.8"
 IDLE_GREY = "#9aa5b1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -167,11 +172,12 @@ class SharpApp(Base):
         self.use_sharp = None
         self._crop_keep = None
         self._crop_src_shape = None
+        self._sharp_last = None
         super().__init__()
-        self.title(mark_ui.APP + f"  (+ ตัวตรวจคมชัด {SHARP_VER} / {getattr(SC, 'LOOSE_VERSION', '?')} / {getattr(SC, 'GUARD_VERSION', '?')})")
+        self.title(mark_ui.APP + f"  (+ ตัวตรวจคมชัด {SHARP_VER} / {getattr(SC, 'FINAL_VERSION', '?')})")
         cfg = SC.load_config()
         self.use_sharp = tk.BooleanVar(value=True)
-        self.match_pct = tk.IntVar(value=int(round(100 * float(cfg.get("match_min", 0.5)))))
+        self.match_pct = tk.IntVar(value=int(round(100 * float(cfg.get("f_part_area", 0.20)))))
         self._crop_keep = cfg.get("test_crop")
         for name, val in (("show_ok", True),):
             v = self.__dict__.get(name)
@@ -183,8 +189,8 @@ class SharpApp(Base):
             pass
         bar = tk.Frame(self, bg=mark_ui.CARD)
         ttk.Checkbutton(bar, text="ใช้ตัวตรวจคมชัด", variable=self.use_sharp).pack(side="left", padx=(10, 6))
-        tk.Label(bar, text="match ขั้นต่ำ %", bg=mark_ui.CARD, font=mark_ui.F(9, "bold")).pack(side="left", padx=(8, 2))
-        ttk.Spinbox(bar, from_=0, to=100, increment=5, textvariable=self.match_pct, width=5,
+        tk.Label(bar, text="NG เมื่อหาย ≥ %", bg=mark_ui.CARD, font=mark_ui.F(9, "bold")).pack(side="left", padx=(8, 2))
+        ttk.Spinbox(bar, from_=5, to=80, increment=5, textvariable=self.match_pct, width=5,
                     command=self._save_match).pack(side="left")
         ttk.Button(bar, text="✂ ครอบรูป Test", command=self.open_crop).pack(side="left", padx=6)
         self.crop_lbl = tk.Label(bar, text="", bg=mark_ui.CARD, fg="#1d5a93", font=mark_ui.F(9))
@@ -196,6 +202,18 @@ class SharpApp(Base):
         else:
             bar.pack(fill="x", padx=6)
         self._crop_label()
+        # v1.8: กล้องสด + จำกรอบครอบรูป -> ช่อง Test แสดงเฉพาะส่วนที่ครอบ
+        pn = self.__dict__.get("pn_test")
+        if pn is not None and hasattr(pn, "set"):
+            _orig_set = pn.set
+
+            def _set_test(img, _o=_orig_set):
+                lf = self.__dict__.get("live_frame")
+                if (self._crop_keep and getattr(self, "live", False) and img is not None
+                        and lf is not None and img is lf):
+                    img = apply_crop(img, self._crop_keep)
+                _o(img)
+            pn.set = _set_test
 
     # ---------------------------------------------------------- match / ครอบรูป
     def _save_match(self):
@@ -204,7 +222,7 @@ class SharpApp(Base):
         except (tk.TclError, ValueError):
             return
         cfg = SC.load_config()
-        cfg["match_min"] = v / 100.0
+        cfg["f_part_area"] = v / 100.0
         SC.save_config(cfg)
 
     def _crop_label(self):
@@ -339,6 +357,7 @@ class SharpApp(Base):
 
     def run_inspect(self, frame=None):
         if self.use_sharp is None or not self.use_sharp.get():
+            self._sharp_last = None
             return super().run_inspect(frame)
         test = frame if frame is not None else self.test_img
         if self.busy or test is None or self.master_img is None:
@@ -373,6 +392,23 @@ class SharpApp(Base):
                 self.after(0, lambda e=ex, t=test: self._sharp_err(e, t))
         threading.Thread(target=work, daemon=True).start()
 
+    def refresh_result(self):
+        """v1.8: ภาพผลของตัวตรวจคมชัด = ภาพพื้นขาวของ sharp_final + กรอบ (ติ๊ก 'แสดงกรอบ OK' ได้)"""
+        last = self._sharp_last
+        if last is not None and self.__dict__.get("report") is last.get("report"):
+            view = last.get("aligned")
+            show = True
+            sv = self.__dict__.get("show_ok")
+            if isinstance(sv, tk.Variable):
+                show = bool(sv.get())
+            try:
+                img = SC.final_draw(view, last["report"]["elements"], show)
+            except Exception:
+                img = last.get("overlay")
+            self._show_result_img(img, f"ผลตรวจ : {last['report'].get('verdict', '')}")
+            return
+        return super().refresh_result()
+
     def _sharp_err(self, ex, test=None):
         self.busy = False
         self._big("ERR", "#cc2b2b")
@@ -390,11 +426,14 @@ class SharpApp(Base):
         if r.get("debug_dir"):
             notes.append("debug: " + os.path.relpath(r["debug_dir"], BASE_DIR))
         self._pre_msgs = [f"ตัวตรวจคมชัด {SHARP_VER}"] + notes
+        self._sharp_last = r
         try:
             super()._on_result((r["report"], r["overlay"], r["aligned"]))
         except Exception as ex:
             traceback.print_exc()
             self._sharp_err(ex, r.get("overlay"))
+            return
+        self.refresh_result()
 
 
 def main():

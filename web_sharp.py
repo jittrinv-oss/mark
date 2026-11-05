@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-web_sharp.py v1.6 — เว็บตรวจมาร์ค (มือถือ / iPad) + ตัวตรวจคมชัด (sharp_check.py)
+web_sharp.py v1.7 — เว็บตรวจมาร์ค (มือถือ / iPad) + ตัวตรวจคมชัด (sharp_check.py)
 ไม่แก้ไฟล์เดิม: ใช้หน้าเว็บ/ฟังก์ชันของ web_app.py
+v1.7: ใช้ sharp_final (ตัวตัดสินสุดท้าย) — ชิ้นงานดีไม่ขึ้นส้ม/แดง, ภาพผลพื้นขาวไม่มีลาย
+      ช่อง "NG เมื่อหาย ≥ %" แทน "match ขั้นต่ำ %" (ค่าเริ่ม 20)
 v1.6: เพิ่ม sharp_guard (SNI ขีดล่างหาย / ขาตัวอักษรหาย ต้องเจอ + กรอบตรงตำแหน่ง)
 v1.5: แก้ "align() takes 4 positional arguments but 5 were given" (ใช้ sharp_loose v2)
       ตรวจพลาด -> แสดงข้อความ error พร้อมเหตุผล (ไม่ทิ้งหน้าเปล่า)
@@ -20,7 +22,8 @@ try:
 except Exception as _ex:
     print("sharp_fix:", _ex)
 import sharp_loose  # noqa: F401  loose v3 (ลดส้ม/แดง — ไม่แก้)
-import sharp_guard  # noqa: F401  guard v1 (จับเส้น/ขีดหายจริง + กรอบตรงตำแหน่ง)
+import sharp_guard  # noqa: F401  guard v1 (สำรอง)
+import sharp_final  # noqa: F401  final v1 (ตัวตัดสินสุดท้าย)
 
 CROP_JS = r"""
 <script>
@@ -52,7 +55,7 @@ CROP_JS = r"""
 
 def extra_html():
     cfg = SC.load_config()
-    mm = int(round(100 * float(cfg.get("match_min", 0.5))))
+    mm = int(round(100 * float(cfg.get("f_part_area", 0.20))))
     return ('<div class="card"><label>✂ ครอบรูป Test (ไม่บังคับ)</label>'
             '<div class="small">เลือก/ถ่ายรูป Test ด้านบนก่อน แล้วลากนิ้วบนภาพครอบเฉพาะมาร์ค</div>'
             '<canvas id="cc" style="width:100%;display:none;touch-action:none;border-radius:8px;margin:6px 0"></canvas>'
@@ -62,9 +65,9 @@ def extra_html():
             '<input type="hidden" name="cx1" id="cx1"><input type="hidden" name="cy1" id="cy1"></div>'
             '<div class="card"><label><input type="checkbox" name="sharp" value="1" checked> '
             'ใช้ตัวตรวจคมชัด</label>'
-            f'<label>match ขั้นต่ำ % <input type="number" name="match_min" value="{mm}" min="0" max="100" step="5" '
+            f'<label>NG เมื่อหาย ≥ % <input type="number" name="f_part_area" value="{mm}" min="5" max="80" step="5" '
             'style="font-size:20px;width:90px"></label>'
-            '<div class="small">ชิ้นที่ match ถึงเกณฑ์ไม่ขึ้นส้ม/แดง — ลด = alarm น้อยลง (แนะนำ 40–60)</div></div>')
+            '<div class="small">ส่วนที่หายต่อเนื่องของตัวอักษร ≥ ค่านี้ = NG — เพิ่ม = alarm น้อยลง (แนะนำ 15–30)</div></div>')
 
 
 def page_form(model="", note=""):
@@ -124,9 +127,9 @@ def run_sharp(model, mdata, mname, tdata, tname, use_last, fields):
         msgs.append(cm)
     cfg = SC.load_config()
     try:
-        mm = max(0, min(100, int(float(fields.get("match_min", "")))))
-        if abs(mm / 100.0 - cfg.get("match_min", 0.5)) > 1e-6:
-            cfg["match_min"] = mm / 100.0
+        mm = max(5, min(80, int(float(fields.get("f_part_area", "")))))
+        if abs(mm / 100.0 - cfg.get("f_part_area", 0.20)) > 1e-6:
+            cfg["f_part_area"] = mm / 100.0
             SC.save_config(cfg)
     except ValueError:
         pass
@@ -149,7 +152,7 @@ def run_sharp(model, mdata, mname, tdata, tname, use_last, fields):
         bad = [e for e in rep["elements"] if e["status"] in ("MISSING", "PARTIAL")]
         with open(os.path.join(folder, "report.json"), "w", encoding="utf-8") as f:
             json.dump(dict(verdict=verdict, model=mdl, notes=msgs, defects=bad,
-                           match_min=cfg.get("match_min")), f, indent=2, ensure_ascii=False, default=str)
+                           f_part_area=cfg.get("f_part_area")), f, indent=2, ensure_ascii=False, default=str)
         row = [time.strftime("%Y-%m-%d %H:%M:%S", now), mdl, verdict, rep.get("n_missing", 0), rep.get("n_partial", 0),
                " ".join(f"#{e['id']}" for e in bad), mname or "(เดิม)", tname, os.path.relpath(folder, W.RESULTS)]
         for log in (os.path.join(W.RESULTS, mdl, "log.csv"), os.path.join(W.RESULTS, "log_all.csv")):
@@ -198,7 +201,7 @@ class Handler(W.Handler):
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print(f"โปรแกรมตรวจมาร์ค (เว็บ + ตัวตรวจคมชัด v1.6, {SC.VERSION}) พร้อมแล้ว:")
+    print(f"โปรแกรมตรวจมาร์ค (เว็บ + ตัวตรวจคมชัด v1.7, {SC.VERSION}) พร้อมแล้ว:")
     for ip in W.local_ips():
         print(f"   http://{ip}:{port}")
     try:
